@@ -10,8 +10,10 @@
 #   APG:               python ppo.py --algorithm apg --env_id <your-diff-env>
 import os
 import random
+import sys
 import time
 from dataclasses import dataclass
+from dataclasses import fields as dataclass_fields
 from typing import Optional
 
 import gymnasium as gym
@@ -25,7 +27,7 @@ from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-from franka_reach_env import FrankaReachEnv, FrankaReachAPGEnv
+from env_registry import get_env_spec
 
 
 @dataclass
@@ -46,6 +48,8 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    headless: bool = True
+    """whether to run custom environments without an interactive viewer window"""
 
     # Algorithm selection
     algorithm: str = "ppo"
@@ -108,6 +112,35 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
+def _normalize_cli_args(argv: list[str]) -> list[str]:
+    """Allow legacy key-value CLI style without leading dashes.
+
+    Examples:
+      python rl.py env_id FrankaReach-v0
+      python rl.py env_id=FrankaReach-v0
+    """
+    valid_keys = {f.name for f in dataclass_fields(Args)}
+    normalized: list[str] = []
+
+    for token in argv:
+        if token.startswith("-"):
+            normalized.append(token)
+            continue
+
+        if "=" in token:
+            key, value = token.split("=", 1)
+            if key in valid_keys:
+                normalized.extend([f"--{key}", value])
+                continue
+
+        if token in valid_keys:
+            normalized.append(f"--{token}")
+        else:
+            normalized.append(token)
+
+    return normalized
+
+
 def make_env(env_id, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
@@ -119,6 +152,32 @@ def make_env(env_id, idx, capture_video, run_name):
         return env
 
     return thunk
+
+
+def make_custom_vec_env(env_id, num_envs, algorithm, device, headless):
+    env_spec = get_env_spec(env_id)
+    if env_spec is None:
+        return None
+
+    if algorithm == "ppo":
+        if env_spec.ppo_factory is None:
+            raise ValueError(f"Environment '{env_id}' does not implement PPO mode.")
+        gym_envs = gym.vector.SyncVectorEnv(
+            [
+                lambda: env_spec.ppo_factory(device="cpu", headless=headless)
+                for _ in range(num_envs)
+            ],
+        )
+        return TorchSyncVecEnv(gym_envs)
+
+    if env_spec.apg_factory is None:
+        raise ValueError(f"Environment '{env_id}' does not implement APG mode.")
+    return env_spec.apg_factory(
+        num_envs=num_envs,
+        max_episode_steps=200,
+        device=str(device),
+        headless=headless,
+    )
 
 
 class TorchSyncVecEnv:
@@ -241,7 +300,7 @@ class Agent(nn.Module):
 
 
 if __name__ == "__main__":
-    args = tyro.cli(Args)
+    args = tyro.cli(Args, args=_normalize_cli_args(sys.argv[1:]))
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
@@ -261,7 +320,8 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     # TRY NOT TO MODIFY: seeding
@@ -279,21 +339,27 @@ if __name__ == "__main__":
     #   step(action: Tensor) -> (obs, reward, terminated, truncated, info)
     #     where all tensors preserve gradients through the dynamics.
     #   Must also have: single_observation_space, single_action_space, num_envs
-    if args.algorithm == "ppo":
-        if args.env_id == "FrankaReach-v0":
-            gym_envs = gym.vector.SyncVectorEnv(
-                [lambda i=i: FrankaReachEnv(device="cpu") for i in range(args.num_envs)],
-            )
-        else:
-            gym_envs = gym.vector.SyncVectorEnv(
-                [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
-            )
+    custom_envs = make_custom_vec_env(
+        env_id=args.env_id,
+        num_envs=args.num_envs,
+        algorithm=args.algorithm,
+        device=device,
+        headless=args.headless,
+    )
+    if custom_envs is not None:
+        envs = custom_envs
+    elif args.algorithm == "ppo":
+        gym_envs = gym.vector.SyncVectorEnv(
+            [
+                make_env(args.env_id, i, args.capture_video, run_name)
+                for i in range(args.num_envs)
+            ],
+        )
         envs = TorchSyncVecEnv(gym_envs)
     else:
-        envs = FrankaReachAPGEnv(
-            num_envs=args.num_envs,
-            max_episode_steps=200,
-            device=str(device),
+        raise ValueError(
+            f"APG requires an implemented differentiable env. "
+            f"'{args.env_id}' is not in IMPLEMENTED_ENVS."
         )
 
     assert isinstance(envs.single_action_space, gym.spaces.Discrete) or isinstance(
@@ -324,8 +390,12 @@ if __name__ == "__main__":
         # ========== PPO Training Loop ==========
 
         # ALGO Logic: Storage setup
-        obs_buf = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-        actions_buf = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+        obs_buf = torch.zeros(
+            (args.num_steps, args.num_envs) + envs.single_observation_space.shape
+        ).to(device)
+        actions_buf = torch.zeros(
+            (args.num_steps, args.num_envs) + envs.single_action_space.shape
+        ).to(device)
         logprobs_buf = torch.zeros((args.num_steps, args.num_envs)).to(device)
         rewards_buf = torch.zeros((args.num_steps, args.num_envs)).to(device)
         dones_buf = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -364,9 +434,19 @@ if __name__ == "__main__":
                 if "final_info" in infos:
                     for info in infos["final_info"]:
                         if info and "episode" in info:
-                            print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                            writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                            writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                            print(
+                                f"global_step={global_step}, episodic_return={info['episode']['r']}"
+                            )
+                            writer.add_scalar(
+                                "charts/episodic_return",
+                                info["episode"]["r"],
+                                global_step,
+                            )
+                            writer.add_scalar(
+                                "charts/episodic_length",
+                                info["episode"]["l"],
+                                global_step,
+                            )
 
             # bootstrap value if not done
             with torch.no_grad():
@@ -380,8 +460,15 @@ if __name__ == "__main__":
                     else:
                         nextnonterminal = 1.0 - dones_buf[t + 1]
                         nextvalues = values_buf[t + 1]
-                    delta = rewards_buf[t] + args.gamma * nextvalues * nextnonterminal - values_buf[t]
-                    advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                    delta = (
+                        rewards_buf[t]
+                        + args.gamma * nextvalues * nextnonterminal
+                        - values_buf[t]
+                    )
+                    advantages[t] = lastgaelam = (
+                        delta
+                        + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                    )
                 returns = advantages + values_buf
 
             # flatten the batch
@@ -402,8 +489,14 @@ if __name__ == "__main__":
                     end = start + args.minibatch_size
                     mb_inds = b_inds[start:end]
 
-                    b_act = b_actions.long()[mb_inds] if agent.discrete else b_actions[mb_inds]
-                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_act)
+                    b_act = (
+                        b_actions.long()[mb_inds]
+                        if agent.discrete
+                        else b_actions[mb_inds]
+                    )
+                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                        b_obs[mb_inds], b_act
+                    )
                     logratio = newlogprob - b_logprobs[mb_inds]
                     ratio = logratio.exp()
 
@@ -411,15 +504,21 @@ if __name__ == "__main__":
                         # calculate approx_kl http://joschu.net/blog/kl-approx.html
                         old_approx_kl = (-logratio).mean()
                         approx_kl = ((ratio - 1) - logratio).mean()
-                        clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+                        clipfracs += [
+                            ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
+                        ]
 
                     mb_advantages = b_advantages[mb_inds]
                     if args.norm_adv:
-                        mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                        mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                            mb_advantages.std() + 1e-8
+                        )
 
                     # Policy loss
                     pg_loss1 = -mb_advantages * ratio
-                    pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                    pg_loss2 = -mb_advantages * torch.clamp(
+                        ratio, 1 - args.clip_coef, 1 + args.clip_coef
+                    )
                     pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                     # Value loss
@@ -438,7 +537,9 @@ if __name__ == "__main__":
                         v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                     entropy_loss = entropy.mean()
-                    loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+                    loss = (
+                        pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+                    )
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -450,10 +551,14 @@ if __name__ == "__main__":
 
             y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
             var_y = np.var(y_true)
-            explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+            explained_var = (
+                np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+            )
 
             # TRY NOT TO MODIFY: record rewards for plotting purposes
-            writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+            writer.add_scalar(
+                "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
+            )
             writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
             writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
             writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
@@ -462,7 +567,9 @@ if __name__ == "__main__":
             writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
             writer.add_scalar("losses/explained_variance", explained_var, global_step)
             print("SPS:", int(global_step / (time.time() - start_time)))
-            writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+            writer.add_scalar(
+                "charts/SPS", int(global_step / (time.time() - start_time)), global_step
+            )
 
     elif args.algorithm == "apg":
         # ========== APG Training Loop ==========
@@ -482,7 +589,9 @@ if __name__ == "__main__":
             # Temperature annealing for Gumbel-Softmax (discrete actions)
             if args.apg_anneal_temp and agent.discrete:
                 frac = 1.0 - (iteration - 1.0) / args.num_iterations
-                temp = args.apg_gumbel_temp_min + frac * (args.apg_gumbel_temp_init - args.apg_gumbel_temp_min)
+                temp = args.apg_gumbel_temp_min + frac * (
+                    args.apg_gumbel_temp_init - args.apg_gumbel_temp_min
+                )
             else:
                 temp = args.apg_gumbel_temp_init
 
@@ -508,14 +617,24 @@ if __name__ == "__main__":
                 done = (terminated | truncated).float()
 
                 # Accumulate discounted return
-                traj_return = traj_return + (args.gamma ** step) * reward.sum()
+                traj_return = traj_return + (args.gamma**step) * reward.sum()
 
                 if "final_info" in infos:
                     for info in infos["final_info"]:
                         if info and "episode" in info:
-                            print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                            writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                            writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                            print(
+                                f"global_step={global_step}, episodic_return={info['episode']['r']}"
+                            )
+                            writer.add_scalar(
+                                "charts/episodic_return",
+                                info["episode"]["r"],
+                                global_step,
+                            )
+                            writer.add_scalar(
+                                "charts/episodic_length",
+                                info["episode"]["l"],
+                                global_step,
+                            )
 
             # Loss: minimize negative discounted return (maximize return)
             loss = -traj_return / envs.num_envs
@@ -525,13 +644,19 @@ if __name__ == "__main__":
             optimizer.step()
 
             # Logging
-            writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-            writer.add_scalar("apg/trajectory_return", traj_return.item() / envs.num_envs, global_step)
+            writer.add_scalar(
+                "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
+            )
+            writer.add_scalar(
+                "apg/trajectory_return", traj_return.item() / envs.num_envs, global_step
+            )
             writer.add_scalar("apg/total_loss", loss.item(), global_step)
             if agent.discrete:
                 writer.add_scalar("apg/gumbel_temperature", temp, global_step)
             print("SPS:", int(global_step / (time.time() - start_time)))
-            writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+            writer.add_scalar(
+                "charts/SPS", int(global_step / (time.time() - start_time)), global_step
+            )
 
     envs.close()
     writer.close()
