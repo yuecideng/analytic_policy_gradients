@@ -112,7 +112,7 @@ def _build_franka_model(num_envs=1, requires_grad=False, device="cpu", urdf_path
         for i, q in enumerate(DEFAULT_JOINT_Q):
             if i < len(builder.joint_q):
                 builder.joint_q[i] = q
-                builder.joint_target[i] = q
+                builder.joint_parent[i] = q
         model = builder.finalize(device=device, requires_grad=requires_grad)
 
         ee_index = None
