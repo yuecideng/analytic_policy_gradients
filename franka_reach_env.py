@@ -44,13 +44,19 @@ TARGET_POS_RANGE = {
 }
 
 
-def _build_viewer(model, headless: bool):
-    """Create Newton viewer with explicit headless control."""
+def _build_viewer(model, headless: bool, num_envs: int = 1):
+    """Create Newton viewer with explicit headless control.
+
+    When num_envs > 1, applies world offsets so every robot is visible in a
+    single scene, matching the pattern used in Newton example_robot_h1.py.
+    """
     if headless:
         viewer = newton_viewer.ViewerNull()
     else:
         viewer = newton_viewer.ViewerGL(headless=False)
     viewer.set_model(model)
+    if num_envs > 1:
+        viewer.set_world_offsets((1.5, 1.5, 0.0))
     return viewer
 
 
@@ -394,6 +400,274 @@ class FrankaReachEnv(gym.Env):
 
 
 # ---------------------------------------------------------------------------
+# Vectorized PPO Environment (batched, all robots in one scene)
+# ---------------------------------------------------------------------------
+
+
+class FrankaReachVecEnv:
+    """Batched Franka reach environment for vectorized PPO.
+
+    All robots live in a single Newton model (via ``ModelBuilder.replicate``)
+    and are rendered in one shared viewer window, matching the pattern used in
+    Newton's ``example_robot_h1.py``.
+
+    Returns numpy arrays compatible with gymnasium VectorEnv conventions:
+      - ``reset()`` → ``(obs [num_envs, 28], info)``
+      - ``step(action [num_envs, 7])`` → ``(obs, reward, terminated, truncated, info)``
+
+    Attributes:
+        single_observation_space: Observation space for one environment.
+        single_action_space: Action space for one environment.
+        num_envs: Number of parallel environments.
+    """
+
+    def __init__(
+        self,
+        num_envs: int = 4,
+        action_scale: float = DEFAULT_ACTION_SCALE,
+        max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
+        substeps: int = DEFAULT_SUBSTEPS,
+        dt: float = DEFAULT_DT,
+        w_rot: float = DEFAULT_W_ROT,
+        device: str = "cpu",
+        headless: bool = True,
+    ):
+        self._num_envs = num_envs
+        self.action_scale = action_scale
+        self.max_episode_steps = max_episode_steps
+        self.substeps = substeps
+        self.dt = dt
+        self.w_rot = w_rot
+        self.device = device
+        self.headless = headless
+
+        self.model, _ = _build_franka_model(
+            num_envs=num_envs,
+            requires_grad=False,
+            device=device,
+        )
+        self.solver = newton.solvers.SolverFeatherstone(self.model)
+
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        self.control = self.model.control()
+        self.contacts = self.model.collide(self.state_0)
+
+        newton.eval_fk(
+            self.model, self.model.joint_q, self.model.joint_qd, self.state_0
+        )
+
+        # Global EEF body index per replicated environment.
+        ee_indices = [
+            i
+            for i, key in enumerate(self.model.body_label)
+            if FRANKA_EE_BODY_NAME in str(key)
+        ]
+        if len(ee_indices) != num_envs:
+            raise RuntimeError(
+                f"Expected {num_envs} '{FRANKA_EE_BODY_NAME}' bodies, "
+                f"found {len(ee_indices)}."
+            )
+        self.ee_body_indices = np.asarray(ee_indices, dtype=np.int32)
+
+        # Single shared viewer — set_world_offsets spreads robots in one scene.
+        self.viewer = _build_viewer(self.model, headless=headless, num_envs=num_envs)
+        self._sim_time = 0.0
+
+        obs_dim = FRANKA_NUM_ARM_JOINTS * 2 + 3 + 4 + 3 + 4  # 28
+        self.single_observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(obs_dim,),
+            dtype=np.float32,
+        )
+        self.single_action_space = gym.spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(FRANKA_NUM_ARM_JOINTS,),
+            dtype=np.float32,
+        )
+
+        self.step_count = np.zeros(num_envs, dtype=np.int32)
+        self.target_pos: np.ndarray | None = None
+        self.target_quat: np.ndarray | None = None
+        self._rng = np.random.default_rng()
+
+    @property
+    def num_envs(self) -> int:
+        return self._num_envs
+
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+        self.step_count[:] = 0
+
+        joint_q_np = np.tile(DEFAULT_JOINT_Q, self._num_envs).astype(np.float32)
+        joint_qd_np = np.zeros(self._num_envs * FRANKA_NUM_JOINTS, dtype=np.float32)
+
+        wp.copy(
+            self.state_0.joint_q,
+            wp.array(joint_q_np, dtype=wp.float32, device=self.model.device),
+        )
+        wp.copy(
+            self.state_0.joint_qd,
+            wp.array(joint_qd_np, dtype=wp.float32, device=self.model.device),
+        )
+        wp.copy(
+            self.control.joint_target_pos,
+            wp.array(joint_q_np, dtype=wp.float32, device=self.model.device),
+        )
+
+        newton.eval_fk(
+            self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
+        )
+
+        self.target_pos, self.target_quat = _sample_target(self._num_envs, self._rng)
+        self._sim_time = 0.0
+        self._render_current_state()
+        return self._get_obs(), {}
+
+    def step(self, actions):
+        """Step all environments.
+
+        Args:
+            actions: Delta joint positions, shape ``[num_envs, 7]``, numpy array.
+
+        Returns:
+            Tuple of ``(obs, reward, terminated, truncated, infos)`` as numpy
+            arrays following the gymnasium VectorEnv convention.  Done
+            environments are auto-reset; their pre-reset observation is stored
+            in ``infos["final_observation"]``.
+        """
+        self.step_count += 1
+        actions = np.clip(np.asarray(actions, dtype=np.float32), -1.0, 1.0)
+
+        # Compute new joint targets: target = current + action * scale, clamped.
+        joint_q_np = self.state_0.joint_q.numpy()
+        full_target = np.tile(DEFAULT_JOINT_Q, self._num_envs).astype(np.float32)
+        for i in range(self._num_envs):
+            q_start = i * FRANKA_NUM_JOINTS
+            new_target = (
+                joint_q_np[q_start : q_start + FRANKA_NUM_ARM_JOINTS]
+                + actions[i] * self.action_scale
+            )
+            new_target = np.clip(
+                new_target, -DEFAULT_ARM_JOINT_LIMIT, DEFAULT_ARM_JOINT_LIMIT
+            )
+            full_target[q_start : q_start + FRANKA_NUM_ARM_JOINTS] = new_target
+
+        wp.copy(
+            self.control.joint_target_pos,
+            wp.array(full_target, dtype=wp.float32, device=self.model.device),
+        )
+
+        for _ in range(self.substeps):
+            self.state_0.clear_forces()
+            self.contacts = self.model.collide(self.state_0)
+            self.solver.step(
+                self.state_0, self.state_1, self.control, self.contacts, self.dt
+            )
+            self.state_0, self.state_1 = self.state_1, self.state_0
+            self._sim_time += self.dt
+
+        obs = self._get_obs()
+        rewards = self._get_rewards()
+        self._render_current_state()
+
+        truncated = self.step_count >= self.max_episode_steps
+        terminated = np.zeros(self._num_envs, dtype=bool)
+        done_mask = truncated | terminated
+
+        infos = {}
+        if done_mask.any():
+            infos["final_observation"] = obs[done_mask].copy()
+            infos["final_info"] = [
+                (
+                    {"episode": {"r": float(rewards[i]), "l": int(self.step_count[i])}}
+                    if done_mask[i]
+                    else None
+                )
+                for i in range(self._num_envs)
+            ]
+            self._reset_done_envs(done_mask)
+            new_obs = self._get_obs()
+            obs[done_mask] = new_obs[done_mask]
+
+        return obs, rewards, terminated, truncated, infos
+
+    def _reset_done_envs(self, done_mask: np.ndarray) -> None:
+        joint_q_np = self.state_0.joint_q.numpy().copy()
+        joint_qd_np = self.state_0.joint_qd.numpy().copy()
+        ctrl_np = self.control.joint_target_pos.numpy().copy()
+
+        for i in range(self._num_envs):
+            if done_mask[i]:
+                q_start = i * FRANKA_NUM_JOINTS
+                joint_q_np[q_start : q_start + FRANKA_NUM_JOINTS] = DEFAULT_JOINT_Q
+                joint_qd_np[q_start : q_start + FRANKA_NUM_JOINTS] = 0.0
+                ctrl_np[q_start : q_start + FRANKA_NUM_JOINTS] = DEFAULT_JOINT_Q
+                self.step_count[i] = 0
+                new_pos, new_quat = _sample_target(1, self._rng)
+                self.target_pos[i] = new_pos[0]
+                self.target_quat[i] = new_quat[0]
+
+        wp.copy(
+            self.state_0.joint_q,
+            wp.array(joint_q_np, dtype=wp.float32, device=self.model.device),
+        )
+        wp.copy(
+            self.state_0.joint_qd,
+            wp.array(joint_qd_np, dtype=wp.float32, device=self.model.device),
+        )
+        wp.copy(
+            self.control.joint_target_pos,
+            wp.array(ctrl_np, dtype=wp.float32, device=self.model.device),
+        )
+        newton.eval_fk(
+            self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
+        )
+
+    def _get_obs(self) -> np.ndarray:
+        joint_q_np = self.state_0.joint_q.numpy()
+        joint_qd_np = self.state_0.joint_qd.numpy()
+        body_q_np = self.state_0.body_q.numpy()
+
+        obs_dim = FRANKA_NUM_ARM_JOINTS * 2 + 3 + 4 + 3 + 4
+        obs = np.empty((self._num_envs, obs_dim), dtype=np.float32)
+        for i in range(self._num_envs):
+            ee_global = self.ee_body_indices[i]
+            eef_pos = body_q_np[ee_global][:3]
+            eef_quat = body_q_np[ee_global][3:7]
+            q_start = i * FRANKA_NUM_JOINTS
+            jpos = joint_q_np[q_start : q_start + FRANKA_NUM_ARM_JOINTS]
+            jvel = joint_qd_np[q_start : q_start + FRANKA_NUM_ARM_JOINTS]
+            obs[i] = np.concatenate(
+                [jpos, jvel, eef_pos, eef_quat, self.target_pos[i], self.target_quat[i]]
+            )
+        return obs
+
+    def _get_rewards(self) -> np.ndarray:
+        body_q_np = self.state_0.body_q.numpy()
+        eef_pos = body_q_np[self.ee_body_indices, :3]
+        eef_quat = body_q_np[self.ee_body_indices, 3:7]
+        return _compute_reward(
+            eef_pos, eef_quat, self.target_pos, self.target_quat, self.w_rot
+        )
+
+    def _render_current_state(self) -> None:
+        if self.viewer is None:
+            return
+        self.viewer.begin_frame(self._sim_time)
+        self.viewer.log_state(self.state_0)
+        self.viewer.end_frame()
+
+    def close(self) -> None:
+        if self.viewer is not None:
+            self.viewer.close()
+            self.viewer = None
+
+
+# ---------------------------------------------------------------------------
 # APG Environment (batched, differentiable)
 # ---------------------------------------------------------------------------
 
@@ -631,7 +905,9 @@ class FrankaReachAPGEnv:
         self.state_1 = self.model.state()
         self.control = self.model.control()
         self.contacts = self.model.collide(self.state_0)
-        self.viewer = _build_viewer(self.model, headless=self.headless)
+        self.viewer = _build_viewer(
+            self.model, headless=self.headless, num_envs=num_envs
+        )
         self._sim_time = 0.0
 
         # Global EEF body index per replicated environment.

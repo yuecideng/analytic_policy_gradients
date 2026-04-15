@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
-from franka_reach_env import FrankaReachAPGEnv, FrankaReachEnv
+from franka_reach_env import FrankaReachAPGEnv, FrankaReachEnv, FrankaReachVecEnv
 
 
 @dataclass(frozen=True)
@@ -14,7 +14,7 @@ class EnvSpec:
 
 IMPLEMENTED_ENVS: Dict[str, EnvSpec] = {
     "FrankaReach-v0": EnvSpec(
-        ppo_factory=lambda **kwargs: FrankaReachEnv(**kwargs),
+        ppo_factory=lambda **kwargs: FrankaReachVecEnv(**kwargs),
         apg_factory=lambda **kwargs: FrankaReachAPGEnv(**kwargs),
     ),
 }

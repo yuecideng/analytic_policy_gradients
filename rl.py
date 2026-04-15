@@ -162,13 +162,9 @@ def make_custom_vec_env(env_id, num_envs, algorithm, device, headless):
     if algorithm == "ppo":
         if env_spec.ppo_factory is None:
             raise ValueError(f"Environment '{env_id}' does not implement PPO mode.")
-        gym_envs = gym.vector.SyncVectorEnv(
-            [
-                lambda: env_spec.ppo_factory(device="cpu", headless=headless)
-                for _ in range(num_envs)
-            ],
-        )
-        return TorchSyncVecEnv(gym_envs)
+        # Use a single batched env so all robots share one scene and one window.
+        env = env_spec.ppo_factory(num_envs=num_envs, device="cpu", headless=headless)
+        return TorchBatchedVecEnv(env)
 
     if env_spec.apg_factory is None:
         raise ValueError(f"Environment '{env_id}' does not implement APG mode.")
@@ -178,6 +174,43 @@ def make_custom_vec_env(env_id, num_envs, algorithm, device, headless):
         device=str(device),
         headless=headless,
     )
+
+
+class TorchBatchedVecEnv:
+    """Wraps a batched numpy env (e.g. FrankaReachVecEnv) with torch tensor I/O.
+
+    All robots live in a single Newton model and are rendered in one shared
+    viewer window (see FrankaReachVecEnv).  This replaces the SyncVectorEnv
+    approach which opened one window per environment.
+    """
+
+    def __init__(self, env):
+        self._env = env
+        self.single_observation_space = env.single_observation_space
+        self.single_action_space = env.single_action_space
+
+    @property
+    def num_envs(self):
+        return self._env.num_envs
+
+    def reset(self, seed=None, **kwargs):
+        obs, info = self._env.reset(seed=seed, **kwargs)
+        return torch.as_tensor(obs, dtype=torch.float32), info
+
+    def step(self, action):
+        if isinstance(action, torch.Tensor):
+            action = action.detach().cpu().numpy()
+        obs, reward, terminated, truncated, info = self._env.step(action)
+        return (
+            torch.as_tensor(obs, dtype=torch.float32),
+            torch.as_tensor(reward, dtype=torch.float32),
+            torch.as_tensor(terminated, dtype=torch.bool),
+            torch.as_tensor(truncated, dtype=torch.bool),
+            info,
+        )
+
+    def close(self):
+        self._env.close()
 
 
 class TorchSyncVecEnv:
