@@ -112,11 +112,11 @@ def _build_franka_model(num_envs=1, requires_grad=False, device="cpu", urdf_path
         for i, q in enumerate(DEFAULT_JOINT_Q):
             if i < len(builder.joint_q):
                 builder.joint_q[i] = q
-                builder.joint_parent[i] = q
+                builder.joint_target_pos[i] = q
         model = builder.finalize(device=device, requires_grad=requires_grad)
 
         ee_index = None
-        for i, key in enumerate(builder.body_key):
+        for i, key in enumerate(builder.body_label):
             if FRANKA_EE_BODY_NAME in str(key):
                 ee_index = i
                 break
@@ -134,10 +134,10 @@ def _build_franka_model(num_envs=1, requires_grad=False, device="cpu", urdf_path
         for i, q in enumerate(DEFAULT_JOINT_Q):
             if i < len(robot_builder.joint_q):
                 robot_builder.joint_q[i] = q
-                robot_builder.joint_target[i] = q
+                robot_builder.joint_target_pos[i] = q
 
         ee_index = None
-        for i, key in enumerate(robot_builder.body_key):
+        for i, key in enumerate(robot_builder.body_label):
             if FRANKA_EE_BODY_NAME in str(key):
                 ee_index = i
                 break
@@ -146,7 +146,7 @@ def _build_franka_model(num_envs=1, requires_grad=False, device="cpu", urdf_path
 
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
-        builder.replicate(robot_builder, num_copies=num_envs)
+        builder.replicate(robot_builder, world_count=num_envs)
         model = builder.finalize(device=device, requires_grad=requires_grad)
 
         return model, ee_index
@@ -272,7 +272,7 @@ class FrankaReachEnv(gym.Env):
             wp.array(joint_qd_np, dtype=wp.float32, device=self.model.device),
         )
         wp.copy(
-            self.control.joint_target,
+            self.control.joint_target_pos,
             wp.array(joint_q_np, dtype=wp.float32, device=self.model.device),
         )
         newton.eval_fk(
@@ -307,7 +307,7 @@ class FrankaReachEnv(gym.Env):
         full_target[:FRANKA_NUM_ARM_JOINTS] = new_target
 
         wp.copy(
-            self.control.joint_target,
+            self.control.joint_target_pos,
             wp.array(full_target, dtype=wp.float32, device=self.model.device),
         )
 
@@ -637,7 +637,7 @@ class FrankaReachAPGEnv:
         # Global EEF body index per replicated environment.
         ee_indices = [
             i
-            for i, key in enumerate(self.model.body_key)
+            for i, key in enumerate(self.model.body_label)
             if FRANKA_EE_BODY_NAME in str(key)
         ]
         if len(ee_indices) != self._num_envs:
@@ -694,7 +694,7 @@ class FrankaReachAPGEnv:
             wp.array(joint_qd_np, dtype=wp.float32, device=self.model.device),
         )
         wp.copy(
-            self.control.joint_target,
+            self.control.joint_target_pos,
             wp.array(joint_q_np, dtype=wp.float32, device=self.model.device),
         )
 
