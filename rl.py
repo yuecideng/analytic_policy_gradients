@@ -62,7 +62,7 @@ class Args:
     """total timesteps of the experiments"""
     num_envs: int = 4
     """the number of parallel game environments"""
-    num_steps: int = 128
+    num_steps: int = 2048
     """the number of steps to run in each environment per policy rollout"""
 
     # Shared hyperparameters
@@ -363,6 +363,9 @@ if __name__ == "__main__":
         next_obs = next_obs.to(device)
         next_done = torch.zeros(args.num_envs, dtype=torch.float32).to(device)
 
+        current_ep_ret = torch.zeros(args.num_envs, dtype=torch.float32).to(device)
+        current_ep_len = torch.zeros(args.num_envs, dtype=torch.float32).to(device)
+
         for iteration in range(1, args.num_iterations + 1):
             # Annealing the rate if instructed to do so.
             if args.anneal_lr:
@@ -389,6 +392,9 @@ if __name__ == "__main__":
                 next_obs = next_obs.to(device)
                 next_done = next_done.to(device)
 
+                current_ep_ret += reward.to(device).view(-1)
+                current_ep_len += 1
+
                 if "final_info" in infos:
                     for info in infos["final_info"]:
                         if info and "episode" in info:
@@ -405,6 +411,28 @@ if __name__ == "__main__":
                                 info["episode"]["l"],
                                 global_step,
                             )
+                else:
+                    for i in range(args.num_envs):
+                        if next_done[i]:
+                            print(
+                                f"global_step={global_step}, episodic_return={current_ep_ret[i].item()}"
+                            )
+                            writer.add_scalar(
+                                "charts/episodic_return",
+                                current_ep_ret[i].item(),
+                                global_step,
+                            )
+                            writer.add_scalar(
+                                "charts/episodic_length",
+                                current_ep_len[i].item(),
+                                global_step,
+                            )
+
+                # Reset tracking for done environments
+                for i in range(args.num_envs):
+                    if next_done[i]:
+                        current_ep_ret[i] = 0.0
+                        current_ep_len[i] = 0.0
 
             # bootstrap value if not done
             with torch.no_grad():
@@ -524,7 +552,7 @@ if __name__ == "__main__":
             writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
             writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
             writer.add_scalar("losses/explained_variance", explained_var, global_step)
-            print("SPS:", int(global_step / (time.time() - start_time)))
+            # print("SPS:", int(global_step / (time.time() - start_time)))
             writer.add_scalar(
                 "charts/SPS", int(global_step / (time.time() - start_time)), global_step
             )
@@ -537,6 +565,9 @@ if __name__ == "__main__":
 
         next_obs, _ = envs.reset(seed=args.seed)
         next_obs = next_obs.to(device)
+
+        current_ep_ret = torch.zeros(args.num_envs, dtype=torch.float32).to(device)
+        current_ep_len = torch.zeros(args.num_envs, dtype=torch.float32).to(device)
 
         for iteration in range(1, args.num_iterations + 1):
             # Annealing the rate if instructed to do so.
@@ -560,6 +591,11 @@ if __name__ == "__main__":
             done = torch.zeros(envs.num_envs, dtype=torch.float32, device=device)
             traj_return = torch.tensor(0.0, device=device)
 
+            # Since APG resets the environment at the start of each iteration,
+            # we also zero out the trackers here.
+            current_ep_ret.zero_()
+            current_ep_len.zero_()
+
             for step in range(0, args.num_steps):
                 global_step += args.num_envs
 
@@ -573,6 +609,9 @@ if __name__ == "__main__":
                 terminated = terminated.to(device)
                 truncated = truncated.to(device)
                 done = (terminated | truncated).float()
+
+                current_ep_ret += reward.detach().view(-1)
+                current_ep_len += 1
 
                 # Accumulate discounted return
                 traj_return = traj_return + (args.gamma**step) * reward.sum()
@@ -593,6 +632,28 @@ if __name__ == "__main__":
                                 info["episode"]["l"],
                                 global_step,
                             )
+                else:
+                    for i in range(args.num_envs):
+                        if done[i]:
+                            print(
+                                f"global_step={global_step}, episodic_return={current_ep_ret[i].item()}"
+                            )
+                            writer.add_scalar(
+                                "charts/episodic_return",
+                                current_ep_ret[i].item(),
+                                global_step,
+                            )
+                            writer.add_scalar(
+                                "charts/episodic_length",
+                                current_ep_len[i].item(),
+                                global_step,
+                            )
+
+                # Reset tracking for done environments
+                for i in range(args.num_envs):
+                    if done[i]:
+                        current_ep_ret[i] = 0.0
+                        current_ep_len[i] = 0.0
 
             # Loss: minimize negative discounted return (maximize return)
             loss = -traj_return / envs.num_envs
@@ -611,7 +672,7 @@ if __name__ == "__main__":
             writer.add_scalar("apg/total_loss", loss.item(), global_step)
             if agent.discrete:
                 writer.add_scalar("apg/gumbel_temperature", temp, global_step)
-            print("SPS:", int(global_step / (time.time() - start_time)))
+            # print("SPS:", int(global_step / (time.time() - start_time)))
             writer.add_scalar(
                 "charts/SPS", int(global_step / (time.time() - start_time)), global_step
             )
