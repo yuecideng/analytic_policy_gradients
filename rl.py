@@ -9,7 +9,6 @@
 #   PPO (continuous):  python ppo.py --algorithm ppo --env_id Pendulum-v1
 #   APG:               python ppo.py --algorithm apg --env_id <your-diff-env>
 import os
-import random
 import sys
 import time
 from dataclasses import dataclass
@@ -28,6 +27,7 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 from env_registry import get_env_spec
+from utils import set_seed
 
 
 @dataclass
@@ -284,10 +284,7 @@ if __name__ == "__main__":
     )
 
     # TRY NOT TO MODIFY: seeding
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = args.torch_deterministic
+    set_seed(args.seed, torch_deterministic=args.torch_deterministic)
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
