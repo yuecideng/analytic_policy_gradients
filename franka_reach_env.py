@@ -22,7 +22,7 @@ import newton.viewer as newton_viewer
 # Franka FR3 arm has 7 actuated arm joints.
 FRANKA_NUM_ARM_JOINTS = 7
 FRANKA_EE_BODY_NAME = "fr3_link8"  # last link (flange) in fr3.urdf
-DEFAULT_ACTION_SCALE = 0.1  # radians
+DEFAULT_ACTION_SCALE = 0.01  # radians - very small for physics stability
 DEFAULT_MAX_EPISODE_STEPS = 200
 DEFAULT_SUBSTEPS = 4
 DEFAULT_DT = 1.0 / 100.0
@@ -411,9 +411,9 @@ class FrankaReachVecEnv:
     and are rendered in one shared viewer window, matching the pattern used in
     Newton's ``example_robot_h1.py``.
 
-    Returns numpy arrays compatible with gymnasium VectorEnv conventions:
-      - ``reset()`` → ``(obs [num_envs, 28], info)``
-      - ``step(action [num_envs, 7])`` → ``(obs, reward, terminated, truncated, info)``
+    Returns torch tensors directly for use in the PPO training loop:
+      - ``reset()`` → ``(obs [num_envs, 28] Tensor, info)``
+      - ``step(action [num_envs, 7] Tensor)`` → ``(obs Tensor, reward Tensor, terminated Tensor, truncated Tensor, info)``
 
     Attributes:
         single_observation_space: Observation space for one environment.
@@ -525,21 +525,22 @@ class FrankaReachVecEnv:
         self.target_pos, self.target_quat = _sample_target(self._num_envs, self._rng)
         self._sim_time = 0.0
         self._render_current_state()
-        return self._get_obs(), {}
+        return torch.as_tensor(self._get_obs(), dtype=torch.float32), {}
 
     def step(self, actions):
         """Step all environments.
 
         Args:
-            actions: Delta joint positions, shape ``[num_envs, 7]``, numpy array.
+            actions: Delta joint positions, shape ``[num_envs, 7]``, torch or numpy.
 
         Returns:
-            Tuple of ``(obs, reward, terminated, truncated, infos)`` as numpy
-            arrays following the gymnasium VectorEnv convention.  Done
-            environments are auto-reset; their pre-reset observation is stored
-            in ``infos["final_observation"]``.
+            Tuple of ``(obs, reward, terminated, truncated, infos)`` as torch
+            tensors.  Done environments are auto-reset; their pre-reset
+            observation is stored in ``infos["final_observation"]``.
         """
         self.step_count += 1
+        if isinstance(actions, torch.Tensor):
+            actions = actions.detach().cpu().numpy()
         actions = np.clip(np.asarray(actions, dtype=np.float32), -1.0, 1.0)
 
         # Compute new joint targets: target = current + action * scale, clamped.
@@ -571,11 +572,30 @@ class FrankaReachVecEnv:
             self._sim_time += self.dt
 
         obs = self._get_obs()
+
+        # Check for NaN/Inf in observations (physics solver divergence)
+        nan_mask = ~np.isfinite(obs).all(axis=-1)  # Rows with any non-finite value
+        if nan_mask.any():
+            # Reset environments that have diverged
+            self._reset_done_envs(nan_mask)
+            # Sample new targets for the reset environments
+            for i in range(self._num_envs):
+                if nan_mask[i]:
+                    new_pos, new_quat = _sample_target(1, self._rng)
+                    self.target_pos[i] = new_pos[0]
+                    self.target_quat[i] = new_quat[0]
+            # Get fresh observations
+            obs = self._get_obs()
+
         rewards = self._get_rewards()
+        # Apply large negative penalty for environments that had NaN
+        if nan_mask.any():
+            rewards[nan_mask] = -100.0
+
         self._render_current_state()
 
         truncated = self.step_count >= self.max_episode_steps
-        terminated = np.zeros(self._num_envs, dtype=bool)
+        terminated = nan_mask  # End episodes that had NaN
         done_mask = truncated | terminated
 
         infos = {}
@@ -593,7 +613,13 @@ class FrankaReachVecEnv:
             new_obs = self._get_obs()
             obs[done_mask] = new_obs[done_mask]
 
-        return obs, rewards, terminated, truncated, infos
+        return (
+            torch.as_tensor(obs, dtype=torch.float32),
+            torch.as_tensor(rewards, dtype=torch.float32),
+            torch.as_tensor(terminated, dtype=torch.bool),
+            torch.as_tensor(truncated, dtype=torch.bool),
+            infos,
+        )
 
     def _reset_done_envs(self, done_mask: np.ndarray) -> None:
         joint_q_np = self.state_0.joint_q.numpy().copy()

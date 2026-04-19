@@ -162,9 +162,7 @@ def make_custom_vec_env(env_id, num_envs, algorithm, device, headless):
     if algorithm == "ppo":
         if env_spec.ppo_factory is None:
             raise ValueError(f"Environment '{env_id}' does not implement PPO mode.")
-        # Use a single batched env so all robots share one scene and one window.
-        env = env_spec.ppo_factory(num_envs=num_envs, device="cpu", headless=headless)
-        return TorchBatchedVecEnv(env)
+        return env_spec.ppo_factory(num_envs=num_envs, device="cpu", headless=headless)
 
     if env_spec.apg_factory is None:
         raise ValueError(f"Environment '{env_id}' does not implement APG mode.")
@@ -174,79 +172,6 @@ def make_custom_vec_env(env_id, num_envs, algorithm, device, headless):
         device=str(device),
         headless=headless,
     )
-
-
-class TorchBatchedVecEnv:
-    """Wraps a batched numpy env (e.g. FrankaReachVecEnv) with torch tensor I/O.
-
-    All robots live in a single Newton model and are rendered in one shared
-    viewer window (see FrankaReachVecEnv).  This replaces the SyncVectorEnv
-    approach which opened one window per environment.
-    """
-
-    def __init__(self, env):
-        self._env = env
-        self.single_observation_space = env.single_observation_space
-        self.single_action_space = env.single_action_space
-
-    @property
-    def num_envs(self):
-        return self._env.num_envs
-
-    def reset(self, seed=None, **kwargs):
-        obs, info = self._env.reset(seed=seed, **kwargs)
-        return torch.as_tensor(obs, dtype=torch.float32), info
-
-    def step(self, action):
-        if isinstance(action, torch.Tensor):
-            action = action.detach().cpu().numpy()
-        obs, reward, terminated, truncated, info = self._env.step(action)
-        return (
-            torch.as_tensor(obs, dtype=torch.float32),
-            torch.as_tensor(reward, dtype=torch.float32),
-            torch.as_tensor(terminated, dtype=torch.bool),
-            torch.as_tensor(truncated, dtype=torch.bool),
-            info,
-        )
-
-    def close(self):
-        self._env.close()
-
-
-class TorchSyncVecEnv:
-    """Wraps a gymnasium SyncVectorEnv to use torch tensors.
-
-    For PPO mode, this is sufficient since the rollout uses torch.no_grad().
-    For APG mode, provide a native differentiable torch environment instead.
-    """
-
-    def __init__(self, gym_envs):
-        self._envs = gym_envs
-        self.single_observation_space = gym_envs.single_observation_space
-        self.single_action_space = gym_envs.single_action_space
-
-    @property
-    def num_envs(self):
-        return self._envs.num_envs
-
-    def reset(self, seed=None, **kwargs):
-        obs, info = self._envs.reset(seed=seed, **kwargs)
-        return torch.as_tensor(obs, dtype=torch.float32), info
-
-    def step(self, action):
-        if isinstance(action, torch.Tensor):
-            action = action.detach().cpu().numpy()
-        obs, reward, terminated, truncated, info = self._envs.step(action)
-        return (
-            torch.as_tensor(obs, dtype=torch.float32),
-            torch.as_tensor(reward, dtype=torch.float32),
-            torch.as_tensor(terminated, dtype=torch.bool),
-            torch.as_tensor(truncated, dtype=torch.bool),
-            info,
-        )
-
-    def close(self):
-        self._envs.close()
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -279,7 +204,8 @@ class Agent(nn.Module):
                 nn.Tanh(),
                 layer_init(nn.Linear(64, action_dim), std=0.01),
             )
-            self.actor_log_std = nn.Parameter(torch.zeros(1, action_dim))
+            # Smaller initial std for stability in physics sim (exp(-2.0) ≈ 0.135)
+            self.actor_log_std = nn.Parameter(torch.full((1, action_dim), -2.0))
 
         self.critic = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 64)),
@@ -388,7 +314,6 @@ if __name__ == "__main__":
                 for i in range(args.num_envs)
             ],
         )
-        envs = TorchSyncVecEnv(gym_envs)
     else:
         raise ValueError(
             f"APG requires an implemented differentiable env. "
