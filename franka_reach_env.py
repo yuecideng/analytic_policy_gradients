@@ -27,7 +27,6 @@ FRANKA_EE_BODY_NAME = "fr3_hand_tcp"  # last link (flange) in fr3.urdf
 DEFAULT_ACTION_SCALE = 0.1  # radians - very small for physics stability
 DEFAULT_MAX_EPISODE_STEPS = 30
 DEFAULT_W_ROT = 1.0
-DEFAULT_ARM_JOINT_LIMIT = 2.9
 DEFAULT_SUCCESS_POS_THRESHOLD = 0.005  # meters
 DEFAULT_SUCCESS_ROT_THRESHOLD = 0.1  # quaternion distance
 WORLD_OFFSET = 1.5
@@ -41,10 +40,11 @@ FRANKA_NUM_JOINTS = len(DEFAULT_JOINT_Q)
 
 # Target sampling workspace (in front of robot, reachable region)
 TARGET_POS_RANGE = {
-    "x": (0.3, 0.8),
+    "x": (-0.3, 0.3),
     "y": (-0.4, 0.4),
     "z": (0.1, 0.8),
 }
+TARGET_AXIS_LENGTH = 0.1  # meters, length of each axis line for target visualization
 
 
 def _build_viewer(model, headless: bool, num_envs: int = 1):
@@ -58,9 +58,46 @@ def _build_viewer(model, headless: bool, num_envs: int = 1):
     else:
         viewer = newton_viewer.ViewerGL(headless=False)
     viewer.set_model(model)
-    if num_envs > 1:
-        viewer.set_world_offsets((WORLD_OFFSET, WORLD_OFFSET, 0.0))
+    # if num_envs > 1:
+    #     viewer.set_world_offsets((WORLD_OFFSET, WORLD_OFFSET, 0.0))
     return viewer
+
+
+def _compute_world_offsets(num_envs, spacing=(WORLD_OFFSET, WORLD_OFFSET, 0.0)):
+    """Compute per-environment grid offsets matching Newton's ``compute_world_offsets``."""
+    if num_envs <= 1:
+        return np.zeros((1, 3), dtype=np.float32)
+    spacing = np.array(spacing, dtype=np.float32)
+    nonzeros = np.nonzero(spacing)[0]
+    num_dim = nonzeros.shape[0]
+    if num_dim == 0:
+        return np.zeros((num_envs, 3), dtype=np.float32)
+    side = int(np.ceil(num_envs ** (1.0 / num_dim)))
+    offsets = np.zeros((num_envs, 3), dtype=np.float32)
+    if num_dim == 2:
+        for i in range(num_envs):
+            offsets[i, nonzeros[0]] = (i // side) * spacing[nonzeros[0]]
+            offsets[i, nonzeros[1]] = (i % side) * spacing[nonzeros[1]]
+    elif num_dim == 1:
+        for i in range(num_envs):
+            offsets[i, nonzeros[0]] = i * spacing[nonzeros[0]]
+    # Center the grid (match Newton: keep up-axis correction at zero)
+    mn = offsets.min(axis=0)
+    mx = offsets.max(axis=0)
+    corr = mn + (mx - mn) / 2.0
+    corr[2] = 0.0
+    offsets -= corr
+    return offsets
+
+
+def _quat_to_rotmat(q):
+    """Convert quaternion (x, y, z, w) to 3x3 rotation matrix."""
+    qx, qy, qz, qw = q
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
+        [2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx)],
+        [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)],
+    ])
 
 
 def _resolve_urdf_path():
@@ -301,9 +338,15 @@ class FrankaReachVecEnv:
         self.target_quat = torch.zeros(num_envs, 4, dtype=torch.float32)
 
         self.arm_joint_limit_lower = torch.tensor(
-            self.model.joint_limit_lower, dtype=torch.float32, device=self.device)
+            self.model.joint_limit_lower[:FRANKA_NUM_ARM_JOINTS],
+            dtype=torch.float32,
+            device=self.device,
+        )
         self.arm_joint_limit_upper = torch.tensor(
-            self.model.joint_limit_upper, dtype=torch.float32, device=self.device)
+            self.model.joint_limit_upper[:FRANKA_NUM_ARM_JOINTS],
+            dtype=torch.float32,
+            device=self.device,
+        )
 
     @property
     def num_envs(self) -> int:
@@ -353,7 +396,6 @@ class FrankaReachVecEnv:
 
         # Compute new joint targets: target = current + action * scale, clamped.
         joint_q_t = wp.to_torch(self.state_0.joint_q).view(self._num_envs, -1)
-
         joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] += actions * self.action_scale
         joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] = torch.clamp(
             joint_q_t[:, :FRANKA_NUM_ARM_JOINTS],
@@ -382,6 +424,7 @@ class FrankaReachVecEnv:
         # if nan_mask.any():
         #     rewards[nan_mask] = -100.0
 
+        self._sim_time += self.frame_dt
         self._render_current_state()
 
         truncated = self.step_count >= self.max_episode_steps
@@ -426,7 +469,11 @@ class FrankaReachVecEnv:
             self.ee_body_indices,
         ]
         return _compute_reward(
-            eef_pose[:, :3], eef_pose[:, 3:7], self.target_pos, self.target_quat, self.w_rot
+            eef_pose[:, :3],
+            eef_pose[:, 3:7],
+            self.target_pos,
+            self.target_quat,
+            self.w_rot,
         )
 
     def _check_success(self):
@@ -435,14 +482,100 @@ class FrankaReachVecEnv:
             torch.arange(self._num_envs, device=self.device),
             self.ee_body_indices,
         ]
-        return _check_success(eef_pose[:, :3], eef_pose[:, 3:7], self.target_pos, self.target_quat)
+        return _check_success(
+            eef_pose[:, :3], eef_pose[:, 3:7], self.target_pos, self.target_quat
+        )
 
     def _render_current_state(self) -> None:
         if self.viewer is None:
             return
+        newton.eval_fk(
+            self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
+        )
         self.viewer.begin_frame(self._sim_time)
         self.viewer.log_state(self.state_0)
+        self._draw_axes()
         self.viewer.end_frame()
+
+    def _draw_axes(self) -> None:
+        """Draw coordinate-frame axes for target pose and current EE pose.
+
+        Target axes are drawn in solid RGB; EE axes use darker/distinct tones
+        and are rendered thinner so the two frames are easy to tell apart.
+        ``log_lines`` renders in absolute world coordinates (no automatic
+        per-world offset), so we add the full visual offset manually.
+        """
+        if self.headless:
+            return
+
+        num_envs = self._num_envs
+        L = TARGET_AXIS_LENGTH
+
+        # Per-env grid offsets (replicate + viewer both use the same spacing).
+        env_off = _compute_world_offsets(num_envs) * 2
+
+        # --- target axes (solid, bright) ---
+        target_pos_np = self.target_pos.cpu().numpy()
+        target_quat_np = self.target_quat.cpu().numpy()
+
+        t_begins = np.empty((num_envs * 3, 3), dtype=np.float32)
+        t_ends = np.empty((num_envs * 3, 3), dtype=np.float32)
+        t_colors = np.empty((num_envs * 3, 3), dtype=np.float32)
+
+        target_axis_colors = np.array(
+            [[1.0, 0.2, 0.2], [0.2, 1.0, 0.2], [0.2, 0.2, 1.0]], dtype=np.float32
+        )
+
+        for i in range(num_envs):
+            origin = target_pos_np[i] + env_off[i]
+            R = _quat_to_rotmat(target_quat_np[i])
+            base = i * 3
+            for ax in range(3):
+                t_begins[base + ax] = origin
+                t_ends[base + ax] = origin + R[:, ax] * L
+                t_colors[base + ax] = target_axis_colors[ax]
+
+        self.viewer.log_lines(
+            "/target_axes",
+            wp.array(t_begins, dtype=wp.vec3),
+            wp.array(t_ends, dtype=wp.vec3),
+            wp.array(t_colors, dtype=wp.vec3),
+            width=0.02,
+        )
+
+        # --- EE axes (darker, thinner) ---
+        body_q_t = wp.to_torch(self.state_0.body_q).view(num_envs, -1, 7)
+        ee_pos = body_q_t[
+            torch.arange(num_envs, device=self.device), self.ee_body_indices, :3
+        ].cpu().numpy()
+        ee_quat = body_q_t[
+            torch.arange(num_envs, device=self.device), self.ee_body_indices, 3:7
+        ].cpu().numpy()
+
+        e_begins = np.empty((num_envs * 3, 3), dtype=np.float32)
+        e_ends = np.empty((num_envs * 3, 3), dtype=np.float32)
+        e_colors = np.empty((num_envs * 3, 3), dtype=np.float32)
+
+        ee_axis_colors = np.array(
+            [[0.7, 0.0, 0.0], [0.0, 0.7, 0.0], [0.0, 0.0, 0.7]], dtype=np.float32
+        )
+
+        for i in range(num_envs):
+            origin = ee_pos[i]
+            R = _quat_to_rotmat(ee_quat[i])
+            base = i * 3
+            for ax in range(3):
+                e_begins[base + ax] = origin
+                e_ends[base + ax] = origin + R[:, ax] * L
+                e_colors[base + ax] = ee_axis_colors[ax]
+
+        self.viewer.log_lines(
+            "/ee_axes",
+            wp.array(e_begins, dtype=wp.vec3),
+            wp.array(e_ends, dtype=wp.vec3),
+            wp.array(e_colors, dtype=wp.vec3),
+            width=0.01,
+        )
 
     def close(self) -> None:
         if self.viewer is not None:
@@ -794,7 +927,84 @@ class FrankaReachAPGEnv:
             return
         self.viewer.begin_frame(self._sim_time)
         self.viewer.log_state(self.state_0)
+        self._draw_axes()
         self.viewer.end_frame()
+
+    def _draw_axes(self) -> None:
+        """Draw coordinate-frame axes for target pose and current EE pose."""
+        if self.headless:
+            return
+
+        num_envs = self._num_envs
+        L = TARGET_AXIS_LENGTH
+
+        env_off = _compute_world_offsets(num_envs) * 2.0
+
+        # --- target axes (solid, bright) ---
+        target_pos_np = self.target_pos.cpu().numpy() if isinstance(
+            self.target_pos, torch.Tensor
+        ) else np.array(self.target_pos)
+        target_quat_np = self.target_quat.cpu().numpy() if isinstance(
+            self.target_quat, torch.Tensor
+        ) else np.array(self.target_quat)
+
+        t_begins = np.empty((num_envs * 3, 3), dtype=np.float32)
+        t_ends = np.empty((num_envs * 3, 3), dtype=np.float32)
+        t_colors = np.empty((num_envs * 3, 3), dtype=np.float32)
+
+        target_axis_colors = np.array(
+            [[1.0, 0.2, 0.2], [0.2, 1.0, 0.2], [0.2, 0.2, 1.0]], dtype=np.float32
+        )
+
+        for i in range(num_envs):
+            origin = target_pos_np[i] + env_off[i]
+            R = _quat_to_rotmat(target_quat_np[i])
+            base = i * 3
+            for ax in range(3):
+                t_begins[base + ax] = origin
+                t_ends[base + ax] = origin + R[:, ax] * L
+                t_colors[base + ax] = target_axis_colors[ax]
+
+        self.viewer.log_lines(
+            "/target_axes",
+            wp.array(t_begins, dtype=wp.vec3),
+            wp.array(t_ends, dtype=wp.vec3),
+            wp.array(t_colors, dtype=wp.vec3),
+            width=0.02,
+        )
+
+        # --- EE axes (darker, thinner) ---
+        # body_q_flat = wp.to_torch(self.state_0.body_q).cpu().numpy()  # [total_bodies, 7]
+        # ee_indices_np = self.ee_body_indices if isinstance(
+        #     self.ee_body_indices, np.ndarray
+        # ) else np.array(self.ee_body_indices)
+
+        # e_begins = np.empty((num_envs * 3, 3), dtype=np.float32)
+        # e_ends = np.empty((num_envs * 3, 3), dtype=np.float32)
+        # e_colors = np.empty((num_envs * 3, 3), dtype=np.float32)
+
+        # ee_axis_colors = np.array(
+        #     [[0.7, 0.0, 0.0], [0.0, 0.7, 0.0], [0.0, 0.0, 0.7]], dtype=np.float32
+        # )
+
+        # for i in range(num_envs):
+        #     ee_global = int(ee_indices_np[i])
+        #     ee_pose = body_q_flat[ee_global]
+        #     origin = ee_pose[:3] + env_off[i]
+        #     R = _quat_to_rotmat(ee_pose[3:7])
+        #     base = i * 3
+        #     for ax in range(3):
+        #         e_begins[base + ax] = origin
+        #         e_ends[base + ax] = origin + R[:, ax] * L
+        #         e_colors[base + ax] = ee_axis_colors[ax]
+
+        # self.viewer.log_lines(
+        #     "/ee_axes",
+        #     wp.array(e_begins, dtype=wp.vec3),
+        #     wp.array(e_ends, dtype=wp.vec3),
+        #     wp.array(e_colors, dtype=wp.vec3),
+        #     width=0.01,
+        # )
 
     def close(self):
         if self.viewer is not None:
@@ -836,11 +1046,12 @@ if __name__ == "__main__":
     # Simple test: run random actions in the environment
     env = FrankaReachVecEnv(num_envs=4, headless=False)
     obs, info = env.reset(seed=42)
-    from IPython import embed
 
-    embed()
-    for _ in range(100):
-        action = torch.randn(env.num_envs, FRANKA_NUM_ARM_JOINTS) * 0.1
-        obs, reward, terminated, truncated, infos = env.step(action)
-        print(f"Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}")
+    while True:
+        obs, info = env.reset(seed=42)
+        for _ in range(100):
+
+            action = torch.randn(env.num_envs, FRANKA_NUM_ARM_JOINTS) * 0.1
+            obs, reward, terminated, truncated, infos = env.step(action)
+            print(f"Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}")
     env.close()

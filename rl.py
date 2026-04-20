@@ -284,7 +284,7 @@ if __name__ == "__main__":
     )
 
     # TRY NOT TO MODIFY: seeding
-    set_seed(args.seed, torch_deterministic=args.torch_deterministic)
+    set_seed(args.seed, deterministic=args.torch_deterministic)
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
