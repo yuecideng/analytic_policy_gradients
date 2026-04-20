@@ -301,9 +301,9 @@ class FrankaReachVecEnv:
         self.target_quat = torch.zeros(num_envs, 4, dtype=torch.float32)
 
         self.arm_joint_limit_lower = torch.tensor(
-            self.model.joint_limit_lower, dtype=torch.float32, device=self.device)
+            self.model.joint_limit_lower[:FRANKA_NUM_ARM_JOINTS], dtype=torch.float32, device=self.device)
         self.arm_joint_limit_upper = torch.tensor(
-            self.model.joint_limit_upper, dtype=torch.float32, device=self.device)
+            self.model.joint_limit_upper[:FRANKA_NUM_ARM_JOINTS], dtype=torch.float32, device=self.device)
 
     @property
     def num_envs(self) -> int:
@@ -835,12 +835,13 @@ class FrankaReachAPGEnv:
 if __name__ == "__main__":
     # Simple test: run random actions in the environment
     env = FrankaReachVecEnv(num_envs=4, headless=False)
-    obs, info = env.reset(seed=42)
-    from IPython import embed
+    from IPython import embed; embed()
 
-    embed()
-    for _ in range(100):
-        action = torch.randn(env.num_envs, FRANKA_NUM_ARM_JOINTS) * 0.1
-        obs, reward, terminated, truncated, infos = env.step(action)
-        print(f"Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}")
+    while True:
+        obs, info = env.reset(seed=42)
+        for _ in range(100):
+            action = torch.randn(env.num_envs, FRANKA_NUM_ARM_JOINTS)
+            obs, reward, terminated, truncated, infos = env.step(action)
+            print(f"Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}")
+    
     env.close()
