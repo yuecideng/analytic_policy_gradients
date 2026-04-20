@@ -192,10 +192,13 @@ def _build_franka_model(num_envs=1, requires_grad=False, device="cpu", urdf_path
 
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
+        # Use spacing=(0,0,0) so all worlds are at the physical origin; the
+        # viewer applies visual offsets independently via world_offsets.
+        # This keeps body_q in local (per-env) frame and fixes reward maths.
         builder.replicate(
             robot_builder,
             world_count=num_envs,
-            spacing=(WORLD_OFFSET, WORLD_OFFSET, 0.0),
+            spacing=(0.0, 0.0, 0.0),
         )
         model = builder.finalize(device=device, requires_grad=requires_grad)
 
@@ -511,8 +514,14 @@ class FrankaReachVecEnv:
         num_envs = self._num_envs
         L = TARGET_AXIS_LENGTH
 
-        # Per-env grid offsets (replicate + viewer both use the same spacing).
-        env_off = _compute_world_offsets(num_envs) * 2
+        # The viewer applies world_offsets when rendering shapes via log_state,
+        # but log_lines renders in absolute world coordinates without any offset.
+        # body_q is stored in local (per-env) frame (spacing=0 in replicate),
+        # so we must add the same viewer.world_offsets here to stay aligned.
+        if self.viewer.world_offsets is not None:
+            viewer_offsets = self.viewer.world_offsets.numpy()  # [num_worlds, 3]
+        else:
+            viewer_offsets = np.zeros((num_envs, 3), dtype=np.float32)
 
         # --- target axes (solid, bright) ---
         target_pos_np = self.target_pos.cpu().numpy()
@@ -527,7 +536,7 @@ class FrankaReachVecEnv:
         )
 
         for i in range(num_envs):
-            origin = target_pos_np[i] + env_off[i]
+            origin = target_pos_np[i] + viewer_offsets[i]
             R = _quat_to_rotmat(target_quat_np[i])
             base = i * 3
             for ax in range(3):
@@ -561,7 +570,7 @@ class FrankaReachVecEnv:
         )
 
         for i in range(num_envs):
-            origin = ee_pos[i]
+            origin = ee_pos[i] + viewer_offsets[i]
             R = _quat_to_rotmat(ee_quat[i])
             base = i * 3
             for ax in range(3):
