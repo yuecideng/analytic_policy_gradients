@@ -275,7 +275,8 @@ class FrankaReachVecEnv:
                 f"Expected {num_envs} '{FRANKA_EE_BODY_NAME}' bodies, "
                 f"found {len(ee_indices)}."
             )
-        self.ee_body_indices = torch.tensor(ee_indices, dtype=torch.int32)
+        # Assign index 0 to all EEF bodies for use in kernels.
+        self.ee_body_indices = torch.zeros(num_envs, dtype=torch.int32) + ee_indices[0]
 
         # Single shared viewer — set_world_offsets spreads robots in one scene.
         self.viewer = _build_viewer(self.model, headless=headless, num_envs=num_envs)
@@ -296,8 +297,13 @@ class FrankaReachVecEnv:
         )
 
         self.step_count = torch.zeros(num_envs, dtype=torch.int32)
-        self.target_pos = None
-        self.target_quat = None
+        self.target_pos = torch.zeros(num_envs, 3, dtype=torch.float32)
+        self.target_quat = torch.zeros(num_envs, 4, dtype=torch.float32)
+
+        self.arm_joint_limit_lower = torch.tensor(
+            self.model.joint_limit_lower, dtype=torch.float32, device=self.device)
+        self.arm_joint_limit_upper = torch.tensor(
+            self.model.joint_limit_upper, dtype=torch.float32, device=self.device)
 
     @property
     def num_envs(self) -> int:
@@ -351,8 +357,8 @@ class FrankaReachVecEnv:
         joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] += actions * self.action_scale
         joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] = torch.clamp(
             joint_q_t[:, :FRANKA_NUM_ARM_JOINTS],
-            self.model.joint_limit_lower,
-            self.model.joint_limit_upper,
+            self.arm_joint_limit_lower,
+            self.arm_joint_limit_upper,
         )
 
         obs = self._get_obs()
@@ -400,32 +406,36 @@ class FrankaReachVecEnv:
         body_q_t = wp.to_torch(self.state_0.body_q).view(
             self._num_envs, -1, 7
         )  # [num_envs, num_bodies, 7]
-
         obs = torch.empty(
             self._num_envs, self.obs_dim, dtype=torch.float32, device=self.device
         )
         obs[:, :FRANKA_NUM_ARM_JOINTS] = joint_q_t[:, :FRANKA_NUM_ARM_JOINTS]
+        env_idx = torch.arange(self._num_envs, device=self.device)
         obs[:, FRANKA_NUM_ARM_JOINTS : FRANKA_NUM_ARM_JOINTS + 7] = body_q_t[
-            :, self.ee_body_indices, :
-        ].squeeze(1)
+            env_idx, self.ee_body_indices, :
+        ]  # EEF pose (pos + quat)
         obs[:, FRANKA_NUM_ARM_JOINTS + 7 : FRANKA_NUM_ARM_JOINTS + 14] = torch.cat(
             [self.target_pos, self.target_quat], dim=-1
         )
         return obs
 
     def _get_rewards(self):
-        body_q_t = wp.to_torch(self.state_0.body_q)
-        eef_pos = body_q_t[self.ee_body_indices, :3]
-        eef_quat = body_q_t[self.ee_body_indices, 3:7]
+        body_q_t = wp.to_torch(self.state_0.body_q).view(self._num_envs, -1, 7)
+        eef_pose = body_q_t[
+            torch.arange(self._num_envs, device=self.device),
+            self.ee_body_indices,
+        ]
         return _compute_reward(
-            eef_pos, eef_quat, self.target_pos, self.target_quat, self.w_rot
+            eef_pose[:, :3], eef_pose[:, 3:7], self.target_pos, self.target_quat, self.w_rot
         )
 
     def _check_success(self):
-        body_q_t = wp.to_torch(self.state_0.body_q)
-        eef_pos = body_q_t[self.ee_body_indices, :3]
-        eef_quat = body_q_t[self.ee_body_indices, 3:7]
-        return _check_success(eef_pos, eef_quat, self.target_pos, self.target_quat)
+        body_q_t = wp.to_torch(self.state_0.body_q).view(self._num_envs, -1, 7)
+        eef_pose = body_q_t[
+            torch.arange(self._num_envs, device=self.device),
+            self.ee_body_indices,
+        ]
+        return _check_success(eef_pose[:, :3], eef_pose[:, 3:7], self.target_pos, self.target_quat)
 
     def _render_current_state(self) -> None:
         if self.viewer is None:
