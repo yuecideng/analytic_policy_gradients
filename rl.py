@@ -50,6 +50,8 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     headless: bool = True
     """whether to run custom environments without an interactive viewer window"""
+    print_every_n_episodes: int = 10
+    """print episodic return to console every N finished episodes (<=0 disables prints)"""
 
     # Algorithm selection
     algorithm: str = "ppo"
@@ -58,7 +60,7 @@ class Args:
     # Environment
     env_id: str = "CartPole-v1"
     """the id of the environment"""
-    total_timesteps: int = 600000
+    total_timesteps: int = 1000000
     """total timesteps of the experiments"""
     num_envs: int = 4
     """the number of parallel game environments"""
@@ -162,7 +164,9 @@ def make_custom_vec_env(env_id, num_envs, algorithm, device, headless):
     if algorithm == "ppo":
         if env_spec.ppo_factory is None:
             raise ValueError(f"Environment '{env_id}' does not implement PPO mode.")
-        return env_spec.ppo_factory(num_envs=num_envs, device="cpu", headless=headless)
+        return env_spec.ppo_factory(
+            num_envs=num_envs, device=str(device), headless=headless
+        )
 
     if env_spec.apg_factory is None:
         raise ValueError(f"Environment '{env_id}' does not implement APG mode.")
@@ -286,7 +290,9 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: seeding
     set_seed(args.seed, deterministic=args.torch_deterministic)
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    device = torch.device(
+        "cuda:0" if torch.cuda.is_available() and args.cuda else "cpu"
+    )
 
     # env setup
     # For PPO: wraps gymnasium envs in a torch-compatible interface.
@@ -340,9 +346,11 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
+    should_print_episodes = args.print_every_n_episodes > 0
 
     if args.algorithm == "ppo":
         # ========== PPO Training Loop ==========
+        episode_count = 0
 
         # ALGO Logic: Storage setup
         obs_buf = torch.zeros(
@@ -395,9 +403,14 @@ if __name__ == "__main__":
                 if "final_info" in infos:
                     for info in infos["final_info"]:
                         if info and "episode" in info:
-                            print(
-                                f"global_step={global_step}, episodic_return={info['episode']['r']}"
-                            )
+                            episode_count += 1
+                            if (
+                                should_print_episodes
+                                and episode_count % args.print_every_n_episodes == 0
+                            ):
+                                print(
+                                    f"global_step={global_step}, episodic_return={info['episode']['r']}"
+                                )
                             writer.add_scalar(
                                 "charts/episodic_return",
                                 info["episode"]["r"],
@@ -411,9 +424,8 @@ if __name__ == "__main__":
                 else:
                     for i in range(args.num_envs):
                         if next_done[i]:
-                            print(
-                                f"global_step={global_step}, episodic_return={current_ep_ret[i].item()}"
-                            )
+                            episode_count += 1
+
                             writer.add_scalar(
                                 "charts/episodic_return",
                                 current_ep_ret[i].item(),
@@ -424,6 +436,13 @@ if __name__ == "__main__":
                                 current_ep_len[i].item(),
                                 global_step,
                             )
+                            if (
+                                should_print_episodes
+                                and episode_count % args.print_every_n_episodes == 0
+                            ):
+                                print(
+                                    f"global_step={global_step}, episodic_return={current_ep_ret[i].item()}"
+                                )
 
                 # Reset tracking for done environments
                 for i in range(args.num_envs):
@@ -482,7 +501,6 @@ if __name__ == "__main__":
                     )
                     logratio = newlogprob - b_logprobs[mb_inds]
                     ratio = logratio.exp()
-
                     with torch.no_grad():
                         # calculate approx_kl http://joschu.net/blog/kl-approx.html
                         old_approx_kl = (-logratio).mean()
@@ -559,6 +577,7 @@ if __name__ == "__main__":
         # Analytic Policy Gradient: backpropagates through a differentiable environment.
         # No value function, no GAE, no clipping. The loss is simply the negative
         # discounted return, and gradients flow through both the policy and the env.
+        episode_count = 0
 
         next_obs, _ = envs.reset(seed=args.seed)
         next_obs = next_obs.to(device)
@@ -616,9 +635,14 @@ if __name__ == "__main__":
                 if "final_info" in infos:
                     for info in infos["final_info"]:
                         if info and "episode" in info:
-                            print(
-                                f"global_step={global_step}, episodic_return={info['episode']['r']}"
-                            )
+                            episode_count += 1
+                            if (
+                                should_print_episodes
+                                and episode_count % args.print_every_n_episodes == 0
+                            ):
+                                print(
+                                    f"global_step={global_step}, episodic_return={info['episode']['r']}"
+                                )
                             writer.add_scalar(
                                 "charts/episodic_return",
                                 info["episode"]["r"],
@@ -632,9 +656,14 @@ if __name__ == "__main__":
                 else:
                     for i in range(args.num_envs):
                         if done[i]:
-                            print(
-                                f"global_step={global_step}, episodic_return={current_ep_ret[i].item()}"
-                            )
+                            episode_count += 1
+                            if (
+                                should_print_episodes
+                                and episode_count % args.print_every_n_episodes == 0
+                            ):
+                                print(
+                                    f"global_step={global_step}, episodic_return={current_ep_ret[i].item()}"
+                                )
                             writer.add_scalar(
                                 "charts/episodic_return",
                                 current_ep_ret[i].item(),

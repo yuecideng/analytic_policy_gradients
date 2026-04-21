@@ -40,9 +40,9 @@ FRANKA_NUM_JOINTS = len(DEFAULT_JOINT_Q)
 
 # Target sampling workspace (in front of robot, reachable region)
 TARGET_POS_RANGE = {
-    "x": (0.3, 0.6),
-    "y": (-0.2, 0.2),
-    "z": (0.3, 0.7),
+    "x": (0.3, 0.3),
+    "y": (0, 0),
+    "z": (0.5, 0.5),
 }
 TARGET_AXIS_LENGTH = 0.1  # meters, length of each axis line for target visualization
 
@@ -220,20 +220,20 @@ def _build_franka_model(num_envs=1, requires_grad=False, device="cpu", urdf_path
 
 
 # TODO: Check for correctness of target sampling.
-def _sample_target(num_envs):
+def _sample_target(num_envs, device="cpu"):
     """Sample random target poses within reachable workspace. Returns torch tensors."""
-    target_pos = torch.zeros(num_envs, 3, dtype=torch.float32)
-    target_pos[:, 0] = TARGET_POS_RANGE["x"][0] + torch.rand(num_envs) * (
-        TARGET_POS_RANGE["x"][1] - TARGET_POS_RANGE["x"][0]
-    )
-    target_pos[:, 1] = TARGET_POS_RANGE["y"][0] + torch.rand(num_envs) * (
-        TARGET_POS_RANGE["y"][1] - TARGET_POS_RANGE["y"][0]
-    )
-    target_pos[:, 2] = TARGET_POS_RANGE["z"][0] + torch.rand(num_envs) * (
-        TARGET_POS_RANGE["z"][1] - TARGET_POS_RANGE["z"][0]
-    )
+    target_pos = torch.zeros(num_envs, 3, dtype=torch.float32, device=device)
+    target_pos[:, 0] = TARGET_POS_RANGE["x"][0] + torch.rand(
+        num_envs, device=device
+    ) * (TARGET_POS_RANGE["x"][1] - TARGET_POS_RANGE["x"][0])
+    target_pos[:, 1] = TARGET_POS_RANGE["y"][0] + torch.rand(
+        num_envs, device=device
+    ) * (TARGET_POS_RANGE["y"][1] - TARGET_POS_RANGE["y"][0])
+    target_pos[:, 2] = TARGET_POS_RANGE["z"][0] + torch.rand(
+        num_envs, device=device
+    ) * (TARGET_POS_RANGE["z"][1] - TARGET_POS_RANGE["z"][0])
     # 180-degree rotation around X-axis: [1, 0, 0, 0]
-    target_quat = torch.zeros(num_envs, 4, dtype=torch.float32)
+    target_quat = torch.zeros(num_envs, 4, dtype=torch.float32, device=device)
     target_quat[:, 0] = 1.0
     return target_pos, target_quat
 
@@ -366,9 +366,9 @@ class FrankaReachVecEnv:
             dtype=np.float32,
         )
 
-        self.step_count = torch.zeros(num_envs, dtype=torch.int32)
-        self.target_pos = torch.zeros(num_envs, 3, dtype=torch.float32)
-        self.target_quat = torch.zeros(num_envs, 4, dtype=torch.float32)
+        self.step_count = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        self.target_pos = torch.zeros(num_envs, 3, dtype=torch.float32, device=device)
+        self.target_quat = torch.zeros(num_envs, 4, dtype=torch.float32, device=device)
 
         self.arm_joint_limit_lower = torch.tensor(
             self.model.joint_limit_lower[:FRANKA_NUM_ARM_JOINTS],
@@ -394,7 +394,11 @@ class FrankaReachVecEnv:
         if seed is not None:
             set_seed(seed)
 
-        local_env_ids = env_ids if env_ids is not None else torch.arange(self._num_envs)
+        local_env_ids = (
+            env_ids
+            if env_ids is not None
+            else torch.arange(self._num_envs, device=self.device)
+        )
 
         self.step_count[:] = 0
 
@@ -425,9 +429,9 @@ class FrankaReachVecEnv:
             self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
         )
 
-        target_pos, target_quat = _sample_target(len(local_env_ids))
-        self.target_pos[local_env_ids] = target_pos.to(self.device)
-        self.target_quat[local_env_ids] = target_quat.to(self.device)
+        target_pos, target_quat = _sample_target(len(local_env_ids), device=self.device)
+        self.target_pos[local_env_ids] = target_pos
+        self.target_quat[local_env_ids] = target_quat
         self._render_current_state()
         return self._get_obs(), {}
 
@@ -458,24 +462,7 @@ class FrankaReachVecEnv:
 
         obs = self._get_obs()
 
-        # Check for NaN/Inf in observations (physics solver divergence)
-        # nan_mask = ~torch.isfinite(obs).all(dim=-1)
-        # if nan_mask.any():
-        #     # Reset environments that have diverged
-        #     self._reset_done_envs(nan_mask)
-        #     # Sample new targets for the reset environments
-        #     for i in range(self._num_envs):
-        #         if nan_mask[i]:
-        #             new_pos, new_quat = _sample_target(1)
-        #             self.target_pos[i] = new_pos[0].to(self.device)
-        #             self.target_quat[i] = new_quat[0].to(self.device)
-        #     # Get fresh observations
-        #     obs = self._get_obs()
-
         rewards = self._get_rewards(actions)
-        # Apply large negative penalty for environments that had NaN
-        # if nan_mask.any():
-        #     rewards[nan_mask] = -100.0
 
         self.last_action = actions.clone()
         self._sim_time += self.frame_dt
@@ -969,9 +956,14 @@ class FrankaReachAPGEnv:
             self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
         )
 
-        self.target_pos, self.target_quat = _sample_target(self._num_envs)
+        self.target_pos, self.target_quat = _sample_target(
+            self._num_envs, device=self.device_str
+        )
         self.last_action = torch.zeros(
-            self._num_envs, FRANKA_NUM_ARM_JOINTS, dtype=torch.float32
+            self._num_envs,
+            FRANKA_NUM_ARM_JOINTS,
+            dtype=torch.float32,
+            device=self.device_str,
         )
         self._sim_time = 0.0
         self._render_current_state()
