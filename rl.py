@@ -64,7 +64,7 @@ class Args:
     """total timesteps of the experiments"""
     num_envs: int = 4
     """the number of parallel game environments"""
-    num_steps: int = 256
+    num_steps: int = 128
     """the number of steps to run in each environment per policy rollout"""
 
     # Shared hyperparameters
@@ -267,6 +267,7 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+    print(f"minibatch_size={args.minibatch_size}, num_iterations={args.num_iterations}")
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -400,55 +401,25 @@ if __name__ == "__main__":
                 current_ep_ret += reward.to(device).view(-1)
                 current_ep_len += 1
 
-                if "final_info" in infos:
-                    for info in infos["final_info"]:
-                        if info and "episode" in info:
-                            episode_count += 1
-                            if (
-                                should_print_episodes
-                                and episode_count % args.print_every_n_episodes == 0
-                            ):
-                                print(
-                                    f"global_step={global_step}, episodic_return={info['episode']['r']}"
-                                )
-                            writer.add_scalar(
-                                "charts/episodic_return",
-                                info["episode"]["r"],
-                                global_step,
-                            )
-                            writer.add_scalar(
-                                "charts/episodic_length",
-                                info["episode"]["l"],
-                                global_step,
-                            )
-                else:
-                    for i in range(args.num_envs):
-                        if next_done[i]:
-                            episode_count += 1
-
-                            writer.add_scalar(
-                                "charts/episodic_return",
-                                current_ep_ret[i].item(),
-                                global_step,
-                            )
-                            writer.add_scalar(
-                                "charts/episodic_length",
-                                current_ep_len[i].item(),
-                                global_step,
-                            )
-                            if (
-                                should_print_episodes
-                                and episode_count % args.print_every_n_episodes == 0
-                            ):
-                                print(
-                                    f"global_step={global_step}, episodic_return={current_ep_ret[i].item()}"
-                                )
+                done_mask = next_done.bool()
+                num_done = done_mask.sum().item()
+                if num_done > 0:
+                    episode_count += num_done
+                    avg_ret = current_ep_ret[done_mask].mean().item()
+                    avg_len = current_ep_len[done_mask].mean().item()
+                    writer.add_scalar("charts/episodic_return", avg_ret, global_step)
+                    writer.add_scalar("charts/episodic_length", avg_len, global_step)
+                    if (
+                        should_print_episodes
+                        and episode_count % args.print_every_n_episodes == 0
+                    ):
+                        print(
+                            f"global_step={global_step}, episodic_return={avg_ret}"
+                        )
 
                 # Reset tracking for done environments
-                for i in range(args.num_envs):
-                    if next_done[i]:
-                        current_ep_ret[i] = 0.0
-                        current_ep_len[i] = 0.0
+                current_ep_ret[done_mask] = 0.0
+                current_ep_len[done_mask] = 0.0
 
             # bootstrap value if not done
             with torch.no_grad():
