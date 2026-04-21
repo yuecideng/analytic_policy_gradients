@@ -58,11 +58,11 @@ class Args:
     # Environment
     env_id: str = "CartPole-v1"
     """the id of the environment"""
-    total_timesteps: int = 500000
+    total_timesteps: int = 600000
     """total timesteps of the experiments"""
     num_envs: int = 4
     """the number of parallel game environments"""
-    num_steps: int = 2048
+    num_steps: int = 256
     """the number of steps to run in each environment per policy rollout"""
 
     # Shared hyperparameters

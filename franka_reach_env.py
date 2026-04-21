@@ -24,7 +24,7 @@ from utils import set_seed
 # Franka FR3 arm has 7 actuated arm joints.
 FRANKA_NUM_ARM_JOINTS = 7
 FRANKA_EE_BODY_NAME = "fr3_hand_tcp"  # last link (flange) in fr3.urdf
-DEFAULT_ACTION_SCALE = 0.1  # radians - very small for physics stability
+DEFAULT_ACTION_SCALE = 0.2  # radians - very small for physics stability
 DEFAULT_MAX_EPISODE_STEPS = 30
 DEFAULT_W_ROT = 1.0
 DEFAULT_SUCCESS_POS_THRESHOLD = 0.005  # meters
@@ -40,9 +40,9 @@ FRANKA_NUM_JOINTS = len(DEFAULT_JOINT_Q)
 
 # Target sampling workspace (in front of robot, reachable region)
 TARGET_POS_RANGE = {
-    "x": (-0.3, 0.3),
-    "y": (-0.4, 0.4),
-    "z": (0.1, 0.8),
+    "x": (0.3, 0.6),
+    "y": (-0.2, 0.2),
+    "z": (0.3, 0.7),
 }
 TARGET_AXIS_LENGTH = 0.1  # meters, length of each axis line for target visualization
 
@@ -93,11 +93,25 @@ def _compute_world_offsets(num_envs, spacing=(WORLD_OFFSET, WORLD_OFFSET, 0.0)):
 def _quat_to_rotmat(q):
     """Convert quaternion (x, y, z, w) to 3x3 rotation matrix."""
     qx, qy, qz, qw = q
-    return np.array([
-        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
-        [2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx)],
-        [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)],
-    ])
+    return np.array(
+        [
+            [
+                1 - 2 * (qy * qy + qz * qz),
+                2 * (qx * qy - qw * qz),
+                2 * (qx * qz + qw * qy),
+            ],
+            [
+                2 * (qx * qy + qw * qz),
+                1 - 2 * (qx * qx + qz * qz),
+                2 * (qy * qz - qw * qx),
+            ],
+            [
+                2 * (qx * qz - qw * qy),
+                2 * (qy * qz + qw * qx),
+                1 - 2 * (qx * qx + qy * qy),
+            ],
+        ]
+    )
 
 
 def _resolve_urdf_path():
@@ -218,9 +232,9 @@ def _sample_target(num_envs):
     target_pos[:, 2] = TARGET_POS_RANGE["z"][0] + torch.rand(num_envs) * (
         TARGET_POS_RANGE["z"][1] - TARGET_POS_RANGE["z"][0]
     )
-    # Fixed upright orientation as target: [0, 1, 0, 0]
+    # 180-degree rotation around X-axis: [1, 0, 0, 0]
     target_quat = torch.zeros(num_envs, 4, dtype=torch.float32)
-    target_quat[:, 1] = 1.0
+    target_quat[:, 0] = 1.0
     return target_pos, target_quat
 
 
@@ -231,11 +245,24 @@ def _quat_distance(q1, q2):
     return torch.minimum(d1, d2)
 
 
-def _compute_reward(eef_pos, eef_quat, target_pos, target_quat, w_rot=DEFAULT_W_ROT):
-    """Negative L2 pose distance reward."""
+def _compute_reward(
+    eef_pos, eef_quat, target_pos, target_quat, action=None, last_action=None
+):
+    """Pose-tracking reward adapted from IsaacLab ReachEnvCfg.
+
+    Terms (weights match IsaacLab RewardsCfg, joint_vel term omitted):
+      - position_tracking:             -0.2  * ||pos_ee - pos_cmd||
+      - position_tracking_fine_grained: +0.1 * (1 - tanh(dist / 0.1))
+      - orientation_tracking:          -0.1  * quat_dist(q_ee, q_cmd)
+      - action_rate:                   -1e-4 * ||action - prev_action||^2
+    """
     pos_dist = (eef_pos - target_pos).norm(dim=-1)
     rot_dist = _quat_distance(eef_quat, target_quat)
-    return -pos_dist - w_rot * rot_dist
+    reward = -0.2 * pos_dist + 0.1 * (1.0 - torch.tanh(pos_dist / 0.1)) - 0.1 * rot_dist
+    if action is not None and last_action is not None:
+        action_rate = ((action - last_action) ** 2).sum(dim=-1)
+        reward = reward - 0.0001 * action_rate
+    return reward
 
 
 def _check_success(
@@ -322,7 +349,10 @@ class FrankaReachVecEnv:
         self.viewer = _build_viewer(self.model, headless=headless, num_envs=num_envs)
         self._sim_time = 0.0
 
-        self.obs_dim = FRANKA_NUM_ARM_JOINTS + 3 + 4 + 3 + 4  # 21
+        # joint_pos(7) + ee_pose(7) + target_pose(7) + last_action(7) = 28
+        self.obs_dim = (
+            FRANKA_NUM_ARM_JOINTS + 3 + 4 + 3 + 4 + FRANKA_NUM_ARM_JOINTS
+        )  # 28
         self.single_observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -351,6 +381,11 @@ class FrankaReachVecEnv:
             device=self.device,
         )
 
+        # Tracks the last applied action for the action-rate reward term.
+        self.last_action = torch.zeros(
+            num_envs, FRANKA_NUM_ARM_JOINTS, dtype=torch.float32, device=device
+        )
+
     @property
     def num_envs(self) -> int:
         return self._num_envs
@@ -363,13 +398,28 @@ class FrankaReachVecEnv:
 
         self.step_count[:] = 0
 
+        # Randomize arm joints by scale in [0.5, 1.5] around default (IsaacLab reset_joints_by_scale).
+        default_arm_q = torch.tensor(
+            DEFAULT_ARM_JOINT_Q, dtype=torch.float32, device=self.device
+        )
+        scales = torch.empty(
+            len(local_env_ids), FRANKA_NUM_ARM_JOINTS, device=self.device
+        ).uniform_(0.5, 1.5)
+        arm_q = torch.clamp(
+            default_arm_q * scales,
+            self.arm_joint_limit_lower,
+            self.arm_joint_limit_upper,
+        )
         default_q = torch.tensor(
             DEFAULT_JOINT_Q, dtype=torch.float32, device=self.device
         )
-        joint_q_t = default_q.repeat(len(local_env_ids), 1)
+        joint_q_t = default_q.unsqueeze(0).expand(len(local_env_ids), -1).clone()
+        joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] = arm_q
 
         joint_q = wp.to_torch(self.state_0.joint_q).view(self._num_envs, -1)
         joint_q[local_env_ids] = joint_q_t
+
+        self.last_action[local_env_ids] = 0.0
 
         newton.eval_fk(
             self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
@@ -422,11 +472,12 @@ class FrankaReachVecEnv:
         #     # Get fresh observations
         #     obs = self._get_obs()
 
-        rewards = self._get_rewards()
+        rewards = self._get_rewards(actions)
         # Apply large negative penalty for environments that had NaN
         # if nan_mask.any():
         #     rewards[nan_mask] = -100.0
 
+        self.last_action = actions.clone()
         self._sim_time += self.frame_dt
         self._render_current_state()
 
@@ -463,9 +514,10 @@ class FrankaReachVecEnv:
         obs[:, FRANKA_NUM_ARM_JOINTS + 7 : FRANKA_NUM_ARM_JOINTS + 14] = torch.cat(
             [self.target_pos, self.target_quat], dim=-1
         )
+        obs[:, FRANKA_NUM_ARM_JOINTS + 14 :] = self.last_action
         return obs
 
-    def _get_rewards(self):
+    def _get_rewards(self, action: torch.Tensor | None = None):
         body_q_t = wp.to_torch(self.state_0.body_q).view(self._num_envs, -1, 7)
         eef_pose = body_q_t[
             torch.arange(self._num_envs, device=self.device),
@@ -476,7 +528,8 @@ class FrankaReachVecEnv:
             eef_pose[:, 3:7],
             self.target_pos,
             self.target_quat,
-            self.w_rot,
+            action=action,
+            last_action=self.last_action,
         )
 
     def _check_success(self):
@@ -554,12 +607,20 @@ class FrankaReachVecEnv:
 
         # --- EE axes (darker, thinner) ---
         body_q_t = wp.to_torch(self.state_0.body_q).view(num_envs, -1, 7)
-        ee_pos = body_q_t[
-            torch.arange(num_envs, device=self.device), self.ee_body_indices, :3
-        ].cpu().numpy()
-        ee_quat = body_q_t[
-            torch.arange(num_envs, device=self.device), self.ee_body_indices, 3:7
-        ].cpu().numpy()
+        ee_pos = (
+            body_q_t[
+                torch.arange(num_envs, device=self.device), self.ee_body_indices, :3
+            ]
+            .cpu()
+            .numpy()
+        )
+        ee_quat = (
+            body_q_t[
+                torch.arange(num_envs, device=self.device), self.ee_body_indices, 3:7
+            ]
+            .cpu()
+            .numpy()
+        )
 
         e_begins = np.empty((num_envs * 3, 3), dtype=np.float32)
         e_ends = np.empty((num_envs * 3, 3), dtype=np.float32)
@@ -623,10 +684,12 @@ def _compute_reward_kernel(
     body_q: wp.array(dtype=wp.transformf),
     ee_body_indices: wp.array(dtype=wp.int32),
     target_pos: wp.array(dtype=wp.vec3f),
-    w_rot: wp.float32,
     reward_out: wp.array(dtype=wp.float32),
 ):
-    """Compute reward = -||eef_pos - target_pos||^2 (squared distance, fully differentiable)."""
+    """IsaacLab-style position reward (fully differentiable).
+
+    reward = -0.2 * pos_dist + 0.1 * (1 - tanh(pos_dist / 0.1))
+    """
     env_idx = wp.tid()
     ee_global = ee_body_indices[env_idx]
 
@@ -635,11 +698,13 @@ def _compute_reward_kernel(
 
     t_pos = target_pos[env_idx]
 
-    # Squared position distance (differentiable, no sqrt)
     diff = eef_pos - t_pos
     pos_dist_sq = wp.dot(diff, diff)
+    pos_dist = wp.sqrt(pos_dist_sq + wp.float32(1e-8))
 
-    reward_out[env_idx] = -pos_dist_sq
+    reward_out[env_idx] = wp.float32(-0.2) * pos_dist + wp.float32(0.1) * (
+        wp.float32(1.0) - wp.tanh(pos_dist / wp.float32(0.1))
+    )
 
 
 class _NewtonStepFunc(torch.autograd.Function):
@@ -721,7 +786,6 @@ class _NewtonStepFunc(torch.autograd.Function):
                     fk_state.body_q,
                     ee_indices_wp,
                     target_pos_wp,
-                    wp.float32(1.0),
                 ],
                 outputs=[reward_wp],
                 device=model.device,
@@ -733,8 +797,8 @@ class _NewtonStepFunc(torch.autograd.Function):
         # Build observation (detached)
         body_q_torch = wp.to_torch(fk_state.body_q)
         joint_q_torch = wp.to_torch(new_joint_q)
-        joint_qd_torch = wp.to_torch(model.joint_qd)  # zero velocities
         ee_indices_np = wp.to_torch(ee_indices_wp).numpy()
+        last_action_t = sim_state["last_action"]  # [num_envs, 7] torch tensor
 
         obs_list = []
         for i in range(num_envs):
@@ -745,14 +809,22 @@ class _NewtonStepFunc(torch.autograd.Function):
 
             q_start = i * FRANKA_NUM_JOINTS
             jpos = joint_q_torch[q_start : q_start + FRANKA_NUM_ARM_JOINTS]
-            jvel = joint_qd_torch[q_start : q_start + FRANKA_NUM_ARM_JOINTS]
 
             target_pos_t = torch.tensor(
                 target_pos_np[i], dtype=torch.float32, device=device_str
             )
             target_quat_t = torch.zeros(4, dtype=torch.float32, device=device_str)
             obs_list.append(
-                torch.cat([jpos, jvel, eef_pos, eef_quat, target_pos_t, target_quat_t])
+                torch.cat(
+                    [
+                        jpos,
+                        eef_pos,
+                        eef_quat,
+                        target_pos_t,
+                        target_quat_t,
+                        last_action_t[i].to(device_str),
+                    ]
+                )
             )
 
         obs_torch = torch.stack(obs_list).detach()
@@ -850,7 +922,8 @@ class FrankaReachAPGEnv:
         )
         self._render_current_state()
 
-        obs_dim = FRANKA_NUM_ARM_JOINTS * 2 + 3 + 4 + 3 + 4  # 28
+        # joint_pos(7) + ee_pose(7) + target_pose(7) + last_action(7) = 28
+        obs_dim = FRANKA_NUM_ARM_JOINTS + 3 + 4 + 3 + 4 + FRANKA_NUM_ARM_JOINTS  # 28
         self.single_observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -867,6 +940,9 @@ class FrankaReachAPGEnv:
         self.step_count = 0
         self.target_pos = None
         self.target_quat = None
+        self.last_action = torch.zeros(
+            num_envs, FRANKA_NUM_ARM_JOINTS, dtype=torch.float32
+        )
 
     @property
     def num_envs(self):
@@ -894,6 +970,9 @@ class FrankaReachAPGEnv:
         )
 
         self.target_pos, self.target_quat = _sample_target(self._num_envs)
+        self.last_action = torch.zeros(
+            self._num_envs, FRANKA_NUM_ARM_JOINTS, dtype=torch.float32
+        )
         self._sim_time = 0.0
         self._render_current_state()
         return self._get_obs_detached(), {}
@@ -908,9 +987,11 @@ class FrankaReachAPGEnv:
             "ee_body_indices_wp": self.ee_body_indices_wp,
             "target_pos": self.target_pos,
             "num_envs": self._num_envs,
+            "last_action": self.last_action,
         }
 
         reward, obs, terminated = _NewtonStepFunc.apply(action, sim_state)
+        self.last_action = action.detach().clone()
         self._sim_time += self.frame_dt
         self._render_current_state()
 
@@ -950,12 +1031,16 @@ class FrankaReachAPGEnv:
         env_off = _compute_world_offsets(num_envs) * 2.0
 
         # --- target axes (solid, bright) ---
-        target_pos_np = self.target_pos.cpu().numpy() if isinstance(
-            self.target_pos, torch.Tensor
-        ) else np.array(self.target_pos)
-        target_quat_np = self.target_quat.cpu().numpy() if isinstance(
-            self.target_quat, torch.Tensor
-        ) else np.array(self.target_quat)
+        target_pos_np = (
+            self.target_pos.cpu().numpy()
+            if isinstance(self.target_pos, torch.Tensor)
+            else np.array(self.target_pos)
+        )
+        target_quat_np = (
+            self.target_quat.cpu().numpy()
+            if isinstance(self.target_quat, torch.Tensor)
+            else np.array(self.target_quat)
+        )
 
         t_begins = np.empty((num_envs * 3, 3), dtype=np.float32)
         t_ends = np.empty((num_envs * 3, 3), dtype=np.float32)
@@ -1024,7 +1109,6 @@ class FrankaReachAPGEnv:
         """Get observation as detached tensor (for reset)."""
         body_q_torch = wp.to_torch(self.state_0.body_q)
         joint_q_torch = wp.to_torch(self.state_0.joint_q)
-        joint_qd_torch = wp.to_torch(self.state_0.joint_qd)
 
         obs_list = []
         for i in range(self._num_envs):
@@ -1035,7 +1119,6 @@ class FrankaReachAPGEnv:
 
             q_start = i * FRANKA_NUM_JOINTS
             jpos = joint_q_torch[q_start : q_start + FRANKA_NUM_ARM_JOINTS]
-            jvel = joint_qd_torch[q_start : q_start + FRANKA_NUM_ARM_JOINTS]
 
             target_pos_t = torch.tensor(
                 self.target_pos[i], dtype=torch.float32, device=self.device_str
@@ -1043,24 +1126,31 @@ class FrankaReachAPGEnv:
             target_quat_t = torch.tensor(
                 self.target_quat[i], dtype=torch.float32, device=self.device_str
             )
-
             obs_list.append(
-                torch.cat([jpos, jvel, eef_pos, eef_quat, target_pos_t, target_quat_t])
+                torch.cat(
+                    [
+                        jpos,
+                        eef_pos,
+                        eef_quat,
+                        target_pos_t,
+                        target_quat_t,
+                        self.last_action[i],
+                    ]
+                )
             )
 
         return torch.stack(obs_list)
 
 
 if __name__ == "__main__":
+    import time
+
     # Simple test: run random actions in the environment
     env = FrankaReachVecEnv(num_envs=4, headless=False)
     obs, info = env.reset(seed=42)
-
     while True:
-        obs, info = env.reset(seed=42)
-        for _ in range(100):
 
-            action = torch.randn(env.num_envs, FRANKA_NUM_ARM_JOINTS) * 0.1
-            obs, reward, terminated, truncated, infos = env.step(action)
-            print(f"Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}")
+        action = torch.randn(env.num_envs, FRANKA_NUM_ARM_JOINTS)
+        obs, reward, terminated, truncated, infos = env.step(action)
+        print(f"Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}")
     env.close()
