@@ -386,7 +386,7 @@ if __name__ == "__main__":
         envs.single_action_space, gym.spaces.Box
     ), "only discrete and box action spaces are supported"
 
-    agent = Agent(envs, use_layernorm=(args.algorithm == "apg")).to(device)
+    agent = Agent(envs, use_layernorm=True).to(device)
 
     # optimizer setup
     if args.algorithm == "ppo":
@@ -411,6 +411,9 @@ if __name__ == "__main__":
     if args.algorithm == "ppo":
         # ========== PPO Training Loop ==========
         episode_count = 0
+
+        obs_dim = np.array(envs.single_observation_space.shape).prod()
+        obs_normalizer = RunningObsNormalizer(obs_dim, device)
 
         # ALGO Logic: Storage setup
         obs_buf = torch.zeros(
@@ -440,12 +443,15 @@ if __name__ == "__main__":
 
             for step in range(0, args.num_steps):
                 global_step += args.num_envs
-                obs_buf[step] = next_obs
+
+                obs_normalizer.update(next_obs.detach())
+                norm_obs = obs_normalizer.normalize(next_obs)
+                obs_buf[step] = norm_obs
                 dones_buf[step] = next_done
 
                 # ALGO LOGIC: action logic
                 with torch.no_grad():
-                    action, logprob, _, value = agent.get_action_and_value(next_obs)
+                    action, logprob, _, value = agent.get_action_and_value(norm_obs)
                     values_buf[step] = value.flatten()
                 actions_buf[step] = action
                 logprobs_buf[step] = logprob
@@ -480,7 +486,8 @@ if __name__ == "__main__":
 
             # bootstrap value if not done
             with torch.no_grad():
-                next_value = agent.get_value(next_obs).reshape(1, -1)
+                norm_next_obs = obs_normalizer.normalize(next_obs)
+                next_value = agent.get_value(norm_next_obs).reshape(1, -1)
                 advantages = torch.zeros_like(rewards_buf).to(device)
                 lastgaelam = 0
                 for t in reversed(range(args.num_steps)):
@@ -601,7 +608,7 @@ if __name__ == "__main__":
             )
 
     elif args.algorithm == "apg":
-        # ========== APG Training Loop (Brax-style) ==========
+        # ========== APG Training Loop ==========
         # Short undiscounted rollouts with stateful training (carrying env state
         # across gradient steps), observation normalization, per-param clipping,
         # and exponential LR decay.

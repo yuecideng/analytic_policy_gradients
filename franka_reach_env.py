@@ -40,9 +40,9 @@ FRANKA_NUM_JOINTS = len(DEFAULT_JOINT_Q)
 
 # Target sampling workspace (in front of robot, reachable region)
 TARGET_POS_RANGE = {
-    "x": (0.3, 0.3),
-    "y": (0, 0),
-    "z": (0.5, 0.5),
+    "x": (0.2, 0.4),
+    "y": (-0.1, 0.1),
+    "z": (0.4, 0.6),
 }
 TARGET_AXIS_LENGTH = 0.1  # meters, length of each axis line for target visualization
 
