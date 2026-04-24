@@ -104,6 +104,18 @@ class Args:
     """minimum temperature for Gumbel-Softmax"""
     apg_anneal_temp: bool = True
     """whether to anneal Gumbel-Softmax temperature over training"""
+    apg_horizon_length: int = 32
+    """short rollout horizon per gradient step (Brax-style APG)"""
+    apg_num_grad_steps: int = 8
+    """number of gradient steps per iteration"""
+    apg_adam_b1: float = 0.7
+    """Adam beta1 (Brax uses 0.7 for more responsive updates)"""
+    apg_adam_b2: float = 0.95
+    """Adam beta2 (Brax uses 0.95)"""
+    apg_per_param_clip: float = 1.0
+    """per-parameter gradient clipping before optimizer"""
+    apg_lr_decay: float = 0.997
+    """exponential LR decay rate per gradient step"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -184,30 +196,72 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
+class RunningObsNormalizer:
+    """Welford-style running mean/std tracker for observation normalization."""
+
+    def __init__(self, obs_dim, device):
+        self.mean = torch.zeros(obs_dim, device=device)
+        self.var = torch.ones(obs_dim, device=device)
+        self.count = 1e-4
+
+    def update(self, obs_batch):
+        # Online Welford update on detached obs
+        batch_mean = obs_batch.mean(dim=0)
+        batch_var = obs_batch.var(dim=0, unbiased=False)
+        batch_count = obs_batch.shape[0]
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        self.mean += delta * batch_count / total
+        m2 = (
+            self.var * self.count
+            + batch_var * batch_count
+            + delta**2 * self.count * batch_count / total
+        )
+        self.var = m2 / total
+        self.count = total
+
+    def normalize(self, obs):
+        return (obs - self.mean) / (self.var.sqrt() + 1e-8)
+
+
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, use_layernorm=False):
         super().__init__()
         obs_dim = np.array(envs.single_observation_space.shape).prod()
         self.discrete = isinstance(envs.single_action_space, gym.spaces.Discrete)
 
         if self.discrete:
             n_actions = envs.single_action_space.n
-            self.actor = nn.Sequential(
+            layers = [
                 layer_init(nn.Linear(obs_dim, 64)),
                 nn.Tanh(),
+            ]
+            if use_layernorm:
+                layers.append(nn.LayerNorm(64))
+            layers += [
                 layer_init(nn.Linear(64, 64)),
                 nn.Tanh(),
-                layer_init(nn.Linear(64, n_actions), std=0.01),
-            )
+            ]
+            if use_layernorm:
+                layers.append(nn.LayerNorm(64))
+            layers.append(layer_init(nn.Linear(64, n_actions), std=0.01))
+            self.actor = nn.Sequential(*layers)
         else:
             action_dim = np.array(envs.single_action_space.shape).prod()
-            self.actor_mean = nn.Sequential(
+            layers = [
                 layer_init(nn.Linear(obs_dim, 64)),
                 nn.Tanh(),
+            ]
+            if use_layernorm:
+                layers.append(nn.LayerNorm(64))
+            layers += [
                 layer_init(nn.Linear(64, 64)),
                 nn.Tanh(),
-                layer_init(nn.Linear(64, action_dim), std=0.01),
-            )
+            ]
+            if use_layernorm:
+                layers.append(nn.LayerNorm(64))
+            layers.append(layer_init(nn.Linear(64, action_dim), std=0.01))
+            self.actor_mean = nn.Sequential(*layers)
             # Smaller initial std for stability in physics sim (exp(-2.0) ≈ 0.135)
             self.actor_log_std = nn.Parameter(torch.full((1, action_dim), -2.0))
 
@@ -266,7 +320,11 @@ if __name__ == "__main__":
     args = tyro.cli(Args, args=_normalize_cli_args(sys.argv[1:]))
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
+    if args.algorithm == "apg":
+        apg_batch_size = int(args.num_envs * args.apg_horizon_length * args.apg_num_grad_steps)
+        args.num_iterations = args.total_timesteps // apg_batch_size
+    else:
+        args.num_iterations = args.total_timesteps // args.batch_size
     print(f"minibatch_size={args.minibatch_size}, num_iterations={args.num_iterations}")
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
@@ -328,7 +386,7 @@ if __name__ == "__main__":
         envs.single_action_space, gym.spaces.Box
     ), "only discrete and box action spaces are supported"
 
-    agent = Agent(envs).to(device)
+    agent = Agent(envs, use_layernorm=(args.algorithm == "apg")).to(device)
 
     # optimizer setup
     if args.algorithm == "ppo":
@@ -341,6 +399,7 @@ if __name__ == "__main__":
         optimizer = optim.Adam(
             agent.actor_parameters(),
             lr=args.learning_rate,
+            betas=(args.apg_adam_b1, args.apg_adam_b2),
             eps=1e-5,
         )
 
@@ -542,24 +601,24 @@ if __name__ == "__main__":
             )
 
     elif args.algorithm == "apg":
-        # ========== APG Training Loop ==========
-        # Analytic Policy Gradient: backpropagates through a differentiable environment.
-        # No value function, no GAE, no clipping. The loss is simply the negative
-        # discounted return, and gradients flow through both the policy and the env.
+        # ========== APG Training Loop (Brax-style) ==========
+        # Short undiscounted rollouts with stateful training (carrying env state
+        # across gradient steps), observation normalization, per-param clipping,
+        # and exponential LR decay.
         episode_count = 0
+        total_grad_steps = 0
 
-        next_obs, _ = envs.reset(seed=args.seed)
-        next_obs = next_obs.to(device)
+        obs_dim = np.array(envs.single_observation_space.shape).prod()
+        obs_normalizer = RunningObsNormalizer(obs_dim, device)
+
+        # Stateful: reset once, carry env state forward across gradient steps.
+        obs, _ = envs.reset(seed=args.seed)
+        obs = obs.to(device)
 
         current_ep_ret = torch.zeros(args.num_envs, dtype=torch.float32).to(device)
         current_ep_len = torch.zeros(args.num_envs, dtype=torch.float32).to(device)
 
         for iteration in range(1, args.num_iterations + 1):
-            # Annealing the rate if instructed to do so.
-            if args.anneal_lr:
-                frac = 1.0 - (iteration - 1.0) / args.num_iterations
-                optimizer.param_groups[0]["lr"] = frac * args.learning_rate
-
             # Temperature annealing for Gumbel-Softmax (discrete actions)
             if args.apg_anneal_temp and agent.discrete:
                 frac = 1.0 - (iteration - 1.0) / args.num_iterations
@@ -569,74 +628,104 @@ if __name__ == "__main__":
             else:
                 temp = args.apg_gumbel_temp_init
 
-            optimizer.zero_grad()
+            for grad_step in range(args.apg_num_grad_steps):
+                total_grad_steps += 1
 
-            obs, _ = envs.reset()
-            obs = obs.to(device)
-            done = torch.zeros(envs.num_envs, dtype=torch.float32, device=device)
-            traj_return = torch.tensor(0.0, device=device)
+                # Exponential LR decay per gradient step
+                lr = args.learning_rate * (args.apg_lr_decay ** total_grad_steps)
+                optimizer.param_groups[0]["lr"] = lr
 
-            # Since APG resets the environment at the start of each iteration,
-            # we also zero out the trackers here.
-            current_ep_ret.zero_()
-            current_ep_len.zero_()
+                optimizer.zero_grad()
 
-            for step in range(0, args.num_steps):
-                global_step += args.num_envs
+                # Collect rewards over the short horizon (no gamma discounting)
+                all_rewards = []
 
-                # Differentiable action — gradients flow through into the environment
-                action = agent.get_apg_action(obs, temp=temp)
+                for step in range(args.apg_horizon_length):
+                    global_step += args.num_envs
 
-                # Step through differentiable environment (computation graph preserved)
-                obs, reward, terminated, truncated, infos = envs.step(action)
-                obs = obs.to(device)
-                reward = reward.to(device)
-                terminated = terminated.to(device)
-                truncated = truncated.to(device)
-                done = (terminated | truncated).float()
+                    # Update normalizer with raw obs (detached) and normalize for policy
+                    obs_normalizer.update(obs.detach())
+                    norm_obs = obs_normalizer.normalize(obs)
 
-                current_ep_ret += reward.detach().view(-1)
-                current_ep_len += 1
+                    # Differentiable action — gradients flow through into the environment
+                    action = agent.get_apg_action(norm_obs, temp=temp)
 
-                # Accumulate discounted return
-                traj_return = traj_return + (args.gamma**step) * reward.sum()
+                    # Step through differentiable environment (computation graph preserved)
+                    obs, reward, terminated, truncated, infos = envs.step(action)
+                    obs = obs.to(device)
+                    reward = reward.to(device)
+                    terminated = terminated.to(device)
+                    truncated = truncated.to(device)
+                    done = (terminated | truncated).float()
 
-                done_mask = done.bool()
-                num_done = done_mask.sum().item()
-                if num_done > 0:
-                    episode_count += num_done
-                    avg_ret = current_ep_ret[done_mask].mean().item()
-                    avg_len = current_ep_len[done_mask].mean().item()
-                    writer.add_scalar("charts/episodic_return", avg_ret, global_step)
-                    writer.add_scalar("charts/episodic_length", avg_len, global_step)
-                    if (
-                        should_print_episodes
-                        and episode_count % args.print_every_n_episodes == 0
+                    all_rewards.append(reward.view(-1))
+
+                    current_ep_ret += reward.detach().view(-1)
+                    current_ep_len += 1
+
+                    done_mask = done.bool()
+                    num_done = done_mask.sum().item()
+                    if num_done > 0:
+                        episode_count += num_done
+                        avg_ret = current_ep_ret[done_mask].mean().item()
+                        avg_len = current_ep_len[done_mask].mean().item()
+                        writer.add_scalar("charts/episodic_return", avg_ret, global_step)
+                        writer.add_scalar("charts/episodic_length", avg_len, global_step)
+                        if (
+                            should_print_episodes
+                            and episode_count % args.print_every_n_episodes == 0
+                        ):
+                            print(f"global_step={global_step}, episodic_return={avg_ret}")
+
+                    # Reset tracking for done environments
+                    current_ep_ret[done_mask] = 0.0
+                    current_ep_len[done_mask] = 0.0
+
+                # Undiscounted mean reward loss over the horizon
+                all_rewards_t = torch.stack(all_rewards)  # [horizon, num_envs]
+                loss = -all_rewards_t.mean()
+
+                loss.backward()
+
+                # Per-parameter gradient clipping
+                if args.apg_per_param_clip > 0:
+                    for param in agent.actor_parameters():
+                        if param.grad is not None:
+                            param.grad.clamp_(
+                                -args.apg_per_param_clip, args.apg_per_param_clip
+                            )
+
+                # Global norm clipping
+                nn.utils.clip_grad_norm_(
+                    agent.actor_parameters(), args.max_grad_norm
+                )
+                optimizer.step()
+
+                # Detach obs and env internal state to break computation graph
+                # between gradient steps.  Env state carries forward numerically,
+                # but the autograd tape is cut so the next grad step starts fresh.
+                obs = obs.detach()
+                if hasattr(envs, "detach_state"):
+                    envs.detach_state()
+                else:
+                    for attr in (
+                        "block_pos", "block_angle", "block_vel",
+                        "block_ang_vel", "last_action",
                     ):
-                        print(f"global_step={global_step}, episodic_return={avg_ret}")
+                        t = getattr(envs, attr, None)
+                        if isinstance(t, torch.Tensor):
+                            setattr(envs, attr, t.detach())
 
-                # Reset tracking for done environments
-                current_ep_ret[done_mask] = 0.0
-                current_ep_len[done_mask] = 0.0
-
-            # Loss: minimize negative discounted return (maximize return)
-            loss = -traj_return / envs.num_envs
-
-            loss.backward()
-            nn.utils.clip_grad_norm_(agent.actor_parameters(), args.max_grad_norm)
-            optimizer.step()
-
-            # Logging
+            # Logging (once per iteration, after all grad steps)
             writer.add_scalar(
                 "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
             )
             writer.add_scalar(
-                "apg/trajectory_return", traj_return.item() / envs.num_envs, global_step
+                "apg/horizon_return", all_rewards_t.sum().item() / envs.num_envs, global_step
             )
             writer.add_scalar("apg/total_loss", loss.item(), global_step)
             if agent.discrete:
                 writer.add_scalar("apg/gumbel_temperature", temp, global_step)
-            # print("SPS:", int(global_step / (time.time() - start_time)))
             writer.add_scalar(
                 "charts/SPS", int(global_step / (time.time() - start_time)), global_step
             )
