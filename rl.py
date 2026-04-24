@@ -60,7 +60,7 @@ class Args:
     # Environment
     env_id: str = "CartPole-v1"
     """the id of the environment"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 500000
     """total timesteps of the experiments"""
     num_envs: int = 4
     """the number of parallel game environments"""
@@ -413,9 +413,7 @@ if __name__ == "__main__":
                         should_print_episodes
                         and episode_count % args.print_every_n_episodes == 0
                     ):
-                        print(
-                            f"global_step={global_step}, episodic_return={avg_ret}"
-                        )
+                        print(f"global_step={global_step}, episodic_return={avg_ret}")
 
                 # Reset tracking for done environments
                 current_ep_ret[done_mask] = 0.0

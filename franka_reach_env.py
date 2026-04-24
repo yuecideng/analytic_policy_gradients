@@ -305,24 +305,24 @@ class FrankaReachVecEnv:
         num_envs: int = 4,
         action_scale: float = DEFAULT_ACTION_SCALE,
         max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
-        w_rot: float = DEFAULT_W_ROT,
         device: str = "cpu",
         headless: bool = True,
+        requires_grad: bool = False,
     ):
         self._num_envs = num_envs
         self.action_scale = action_scale
         self.max_episode_steps = max_episode_steps
-        self.w_rot = w_rot
         self.device = device
         self.headless = headless
         self.frame_dt = 1.0 / 60
 
         self.model, _ = _build_franka_model(
             num_envs=num_envs,
-            requires_grad=False,
+            requires_grad=requires_grad,
             device=device,
         )
-        self.solver = newton.solvers.SolverFeatherstone(self.model)
+        if not requires_grad:
+            self.solver = newton.solvers.SolverFeatherstone(self.model)
 
         self.state_0 = self.model.state()
 
@@ -344,6 +344,11 @@ class FrankaReachVecEnv:
             )
         # Assign index 0 to all EEF bodies for use in kernels.
         self.ee_body_indices = torch.zeros(num_envs, dtype=torch.int32) + ee_indices[0]
+        # Global EE body indices (one per env, for Warp kernels used by APG).
+        self._ee_global = np.asarray(ee_indices, dtype=np.int32)
+        self._ee_global_wp = wp.array(
+            self._ee_global, dtype=wp.int32, device=self.model.device
+        )
 
         # Single shared viewer — set_world_offsets spreads robots in one scene.
         self.viewer = _build_viewer(self.model, headless=headless, num_envs=num_envs)
@@ -421,7 +426,8 @@ class FrankaReachVecEnv:
         joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] = arm_q
 
         joint_q = wp.to_torch(self.state_0.joint_q).view(self._num_envs, -1)
-        joint_q[local_env_ids] = joint_q_t
+        with torch.no_grad():
+            joint_q[local_env_ids] = joint_q_t
 
         self.last_action[local_env_ids] = 0.0
 
@@ -593,7 +599,7 @@ class FrankaReachVecEnv:
         )
 
         # --- EE axes (darker, thinner) ---
-        body_q_t = wp.to_torch(self.state_0.body_q).view(num_envs, -1, 7)
+        body_q_t = wp.to_torch(self.state_0.body_q).view(num_envs, -1, 7).detach()
         ee_pos = (
             body_q_t[
                 torch.arange(num_envs, device=self.device), self.ee_body_indices, :3
@@ -694,6 +700,58 @@ def _compute_reward_kernel(
     )
 
 
+@wp.kernel
+def _compute_full_reward_kernel(
+    body_q: wp.array(dtype=wp.transformf),
+    ee_body_indices: wp.array(dtype=wp.int32),
+    target_pos: wp.array(dtype=wp.vec3f),
+    target_quat: wp.array(dtype=wp.quatf),
+    action: wp.array(dtype=wp.float32),
+    last_action: wp.array(dtype=wp.float32),
+    num_arm_joints: wp.int32,
+    reward_out: wp.array(dtype=wp.float32),
+):
+    """Full reward matching _compute_reward (position + orientation + action_rate)."""
+    env_idx = wp.tid()
+    ee_global = ee_body_indices[env_idx]
+
+    ee_transform = body_q[ee_global]
+    eef_pos = wp.transform_get_translation(ee_transform)
+    eef_quat = wp.transform_get_rotation(ee_transform)
+
+    # Position distance
+    diff = eef_pos - target_pos[env_idx]
+    pos_dist = wp.sqrt(wp.dot(diff, diff) + wp.float32(1e-8))
+
+    # Quaternion distance (double cover)
+    tq = target_quat[env_idx]
+    dq_x = eef_quat.x - tq.x
+    dq_y = eef_quat.y - tq.y
+    dq_z = eef_quat.z - tq.z
+    dq_w = eef_quat.w - tq.w
+    d1 = dq_x * dq_x + dq_y * dq_y + dq_z * dq_z + dq_w * dq_w
+    sq_x = eef_quat.x + tq.x
+    sq_y = eef_quat.y + tq.y
+    sq_z = eef_quat.z + tq.z
+    sq_w = eef_quat.w + tq.w
+    d2 = sq_x * sq_x + sq_y * sq_y + sq_z * sq_z + sq_w * sq_w
+    rot_dist = wp.min(d1, d2)
+
+    # Action rate
+    action_rate = wp.float32(0.0)
+    for j in range(num_arm_joints):
+        idx = env_idx * num_arm_joints + j
+        da = action[idx] - last_action[idx]
+        action_rate = action_rate + da * da
+
+    reward_out[env_idx] = (
+        wp.float32(-0.2) * pos_dist
+        + wp.float32(0.1) * (wp.float32(1.0) - wp.tanh(pos_dist / wp.float32(0.1)))
+        - wp.float32(0.1) * rot_dist
+        - wp.float32(0.0001) * action_rate
+    )
+
+
 class _NewtonStepFunc(torch.autograd.Function):
     """Bridges Warp tape autodiff to PyTorch autograd.
 
@@ -709,9 +767,13 @@ class _NewtonStepFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, action_torch, sim_state):
         model = sim_state["model"]
+        state_joint_q = sim_state["state_joint_q"]
         ee_indices_wp = sim_state["ee_body_indices_wp"]
-        target_pos_np = sim_state["target_pos"]
+        target_pos_t = sim_state["target_pos"]
+        target_quat_t = sim_state["target_quat"]
         num_envs = sim_state["num_envs"]
+        last_action_t = sim_state["last_action"]
+        action_scale = sim_state["action_scale"]
 
         device_str = str(action_torch.device)
 
@@ -719,9 +781,10 @@ class _NewtonStepFunc(torch.autograd.Function):
         action_flat = action_torch.detach().clone().reshape(-1).contiguous()
         action_wp = wp.from_torch(action_flat, dtype=wp.float32, requires_grad=True)
 
-        # Create joint_q from action: new_q = current_q + action * scale
-        # We need the state's joint_q to compute the target, but the gradient
-        # should flow through action_wp. We compute the new joint_q in a kernel.
+        # Last action as constant Warp array (no grad needed)
+        last_action_flat = last_action_t.detach().clone().reshape(-1).contiguous()
+        last_action_wp = wp.from_torch(last_action_flat, dtype=wp.float32)
+
         num_joints_per_env = FRANKA_NUM_JOINTS
         new_joint_q = wp.zeros(
             num_envs * num_joints_per_env,
@@ -730,9 +793,22 @@ class _NewtonStepFunc(torch.autograd.Function):
             requires_grad=True,
         )
 
-        # Target and reward arrays
-        target_pos_wp = wp.array(
-            target_pos_np.tolist(), dtype=wp.vec3f, device=model.device
+        # Target arrays
+        target_pos_list = (
+            target_pos_t.cpu().tolist()
+            if isinstance(target_pos_t, torch.Tensor)
+            else target_pos_t.tolist()
+        )
+        target_quat_list = (
+            target_quat_t.cpu().tolist()
+            if isinstance(target_quat_t, torch.Tensor)
+            else target_quat_t.tolist()
+        )
+        target_pos_wp = wp.array(target_pos_list, dtype=wp.vec3f, device=model.device)
+        target_quat_wp = wp.array(
+            [wp.quatf(q[0], q[1], q[2], q[3]) for q in target_quat_list],
+            dtype=wp.quatf,
+            device=model.device,
         )
         reward_wp = wp.zeros(
             num_envs, dtype=wp.float32, device=model.device, requires_grad=True
@@ -749,9 +825,9 @@ class _NewtonStepFunc(torch.autograd.Function):
                 dim=num_envs * FRANKA_NUM_ARM_JOINTS,
                 inputs=[
                     action_wp,
-                    model.joint_q,  # current joint positions (constant, no grad needed)
-                    new_joint_q,  # output: new joint positions (differentiable)
-                    wp.float32(DEFAULT_ACTION_SCALE),
+                    state_joint_q,
+                    new_joint_q,
+                    wp.float32(action_scale),
                     wp.int32(num_joints_per_env),
                     wp.int32(FRANKA_NUM_ARM_JOINTS),
                     wp.int32(num_envs * FRANKA_NUM_ARM_JOINTS),
@@ -765,14 +841,18 @@ class _NewtonStepFunc(torch.autograd.Function):
             # Compute FK to get EEF pose from new joint positions
             newton.eval_fk(model, new_joint_q, fk_state.joint_qd, fk_state)
 
-            # Compute reward in Warp
+            # Compute full reward (position + orientation + action_rate)
             wp.launch(
-                _compute_reward_kernel,
+                _compute_full_reward_kernel,
                 dim=num_envs,
                 inputs=[
                     fk_state.body_q,
                     ee_indices_wp,
                     target_pos_wp,
+                    target_quat_wp,
+                    action_wp,
+                    last_action_wp,
+                    wp.int32(FRANKA_NUM_ARM_JOINTS),
                 ],
                 outputs=[reward_wp],
                 device=model.device,
@@ -785,7 +865,6 @@ class _NewtonStepFunc(torch.autograd.Function):
         body_q_torch = wp.to_torch(fk_state.body_q)
         joint_q_torch = wp.to_torch(new_joint_q)
         ee_indices_np = wp.to_torch(ee_indices_wp).numpy()
-        last_action_t = sim_state["last_action"]  # [num_envs, 7] torch tensor
 
         obs_list = []
         for i in range(num_envs):
@@ -797,18 +876,20 @@ class _NewtonStepFunc(torch.autograd.Function):
             q_start = i * FRANKA_NUM_JOINTS
             jpos = joint_q_torch[q_start : q_start + FRANKA_NUM_ARM_JOINTS]
 
-            target_pos_t = torch.tensor(
-                target_pos_np[i], dtype=torch.float32, device=device_str
+            target_pos_i = torch.tensor(
+                target_pos_list[i], dtype=torch.float32, device=device_str
             )
-            target_quat_t = torch.zeros(4, dtype=torch.float32, device=device_str)
+            target_quat_i = torch.tensor(
+                target_quat_list[i], dtype=torch.float32, device=device_str
+            )
             obs_list.append(
                 torch.cat(
                     [
                         jpos,
                         eef_pos,
                         eef_quat,
-                        target_pos_t,
-                        target_quat_t,
+                        target_pos_i,
+                        target_quat_i,
                         last_action_t[i].to(device_str),
                     ]
                 )
@@ -847,11 +928,13 @@ class _NewtonStepFunc(torch.autograd.Function):
         return action_grad, None
 
 
-class FrankaReachAPGEnv:
+class FrankaReachAPGEnv(FrankaReachVecEnv):
     """Batched Franka reach environment for APG with differentiable physics.
 
-    Returns PyTorch tensors connected to the computation graph via the
-    Warp tape bridge (_NewtonStepFunc).
+    Inherits all shared logic (reset, obs, reward, rendering, auto-reset)
+    from FrankaReachVecEnv.  The only override is ``step()``, which uses the
+    Warp tape bridge (_NewtonStepFunc) so that gradients flow through the
+    forward-kinematics and reward computation.
 
     Interface matches rl.py APG loop:
       - reset() -> (obs [num_envs, 28], info)
@@ -863,282 +946,68 @@ class FrankaReachAPGEnv:
         self,
         num_envs: int = 4,
         max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
-        w_rot: float = DEFAULT_W_ROT,
         device: str = "cpu",
         headless: bool = True,
     ):
-        self._num_envs = num_envs
-        self.max_episode_steps = max_episode_steps
-        self.w_rot = w_rot
-        self.device_str = device
-        self.headless = headless
-        self.frame_dt = 1.0 / 60
-
-        # Build multi-world Newton model with gradient support
-        self.model, self.ee_body_index = _build_franka_model(
+        super().__init__(
             num_envs=num_envs,
-            requires_grad=True,
+            max_episode_steps=max_episode_steps,
             device=device,
+            headless=headless,
+            requires_grad=True,
         )
-        self.solver = newton.solvers.SolverFeatherstone(self.model)
-
-        self.state_0 = self.model.state()
-        self.state_1 = self.model.state()
-        self.viewer = _build_viewer(
-            self.model, headless=self.headless, num_envs=num_envs
-        )
-        self._sim_time = 0.0
-
-        # Global EEF body index per replicated environment.
-        ee_indices = [
-            i
-            for i, key in enumerate(self.model.body_label)
-            if FRANKA_EE_BODY_NAME in str(key)
-        ]
-        if len(ee_indices) != self._num_envs:
-            raise RuntimeError(
-                f"Expected {self._num_envs} '{FRANKA_EE_BODY_NAME}' bodies, found {len(ee_indices)}."
-            )
-        self.ee_body_indices = np.asarray(ee_indices, dtype=np.int32)
-        self.ee_body_indices_wp = wp.array(
-            self.ee_body_indices, dtype=wp.int32, device=self.model.device
-        )
-
-        newton.eval_fk(
-            self.model, self.model.joint_q, self.model.joint_qd, self.state_0
-        )
-        self._render_current_state()
-
-        # joint_pos(7) + ee_pose(7) + target_pose(7) + last_action(7) = 28
-        obs_dim = FRANKA_NUM_ARM_JOINTS + 3 + 4 + 3 + 4 + FRANKA_NUM_ARM_JOINTS  # 28
-        self.single_observation_space = gym.spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(obs_dim,),
-            dtype=np.float32,
-        )
-        self.single_action_space = gym.spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(FRANKA_NUM_ARM_JOINTS,),
-            dtype=np.float32,
-        )
-
-        self.step_count = 0
-        self.target_pos = None
-        self.target_quat = None
-        self.last_action = torch.zeros(
-            num_envs, FRANKA_NUM_ARM_JOINTS, dtype=torch.float32
-        )
-
-    @property
-    def num_envs(self):
-        return self._num_envs
-
-    def reset(self, seed=None, **kwargs):
-        if seed is not None:
-            set_seed(seed)
-        self.step_count = 0
-
-        joint_q_np = np.tile(DEFAULT_JOINT_Q, self._num_envs).astype(np.float32)
-        joint_qd_np = np.zeros(self._num_envs * FRANKA_NUM_JOINTS, dtype=np.float32)
-
-        wp.copy(
-            self.state_0.joint_q,
-            wp.array(joint_q_np, dtype=wp.float32, device=self.model.device),
-        )
-        wp.copy(
-            self.state_0.joint_qd,
-            wp.array(joint_qd_np, dtype=wp.float32, device=self.model.device),
-        )
-
-        newton.eval_fk(
-            self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
-        )
-
-        self.target_pos, self.target_quat = _sample_target(
-            self._num_envs, device=self.device_str
-        )
-        self.last_action = torch.zeros(
-            self._num_envs,
-            FRANKA_NUM_ARM_JOINTS,
-            dtype=torch.float32,
-            device=self.device_str,
-        )
-        self._sim_time = 0.0
-        self._render_current_state()
-        return self._get_obs_detached(), {}
 
     def step(self, action):
-        """Step all envs. action: [num_envs, 7] torch tensor (with grad)."""
+        """Step all envs with differentiable reward. action: [num_envs, 7]."""
         self.step_count += 1
-        action = torch.clamp(action, -1.0, 1.0)
+        if not isinstance(action, torch.Tensor):
+            action = torch.as_tensor(action, dtype=torch.float32)
+        action = torch.clamp(action.to(self.device), -1.0, 1.0)
 
         sim_state = {
             "model": self.model,
-            "ee_body_indices_wp": self.ee_body_indices_wp,
+            "state_joint_q": self.state_0.joint_q,
+            "ee_body_indices_wp": self._ee_global_wp,
             "target_pos": self.target_pos,
+            "target_quat": self.target_quat,
             "num_envs": self._num_envs,
             "last_action": self.last_action,
+            "action_scale": self.action_scale,
         }
 
-        reward, obs, terminated = _NewtonStepFunc.apply(action, sim_state)
+        reward, obs, _ = _NewtonStepFunc.apply(action, sim_state)
+
+        # Update env state for next step (detached from computation graph)
+        with torch.no_grad():
+            joint_q_t = wp.to_torch(self.state_0.joint_q).view(self._num_envs, -1)
+            joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] += action.detach() * self.action_scale
+            joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] = torch.clamp(
+                joint_q_t[:, :FRANKA_NUM_ARM_JOINTS],
+                self.arm_joint_limit_lower,
+                self.arm_joint_limit_upper,
+            )
+
         self.last_action = action.detach().clone()
         self._sim_time += self.frame_dt
         self._render_current_state()
 
-        truncated = torch.full(
-            (self._num_envs,),
-            self.step_count >= self.max_episode_steps,
-            dtype=torch.bool,
-            device=action.device,
-        )
+        truncated = self.step_count >= self.max_episode_steps
+        terminated = self._check_success()
+        done_mask = truncated | terminated
 
         infos = {}
-        if truncated.any():
-            infos["final_info"] = [
-                {"episode": {"r": reward[i].item(), "l": self.step_count}}
-                for i in range(self._num_envs)
-                if truncated[i]
-            ]
+        if done_mask.any():
+            reset_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
+            obs, _ = self.reset(reset_ids)
 
         return obs, reward, terminated, truncated, infos
-
-    def _render_current_state(self):
-        if self.viewer is None:
-            return
-        self.viewer.begin_frame(self._sim_time)
-        self.viewer.log_state(self.state_0)
-        self._draw_axes()
-        self.viewer.end_frame()
-
-    def _draw_axes(self) -> None:
-        """Draw coordinate-frame axes for target pose and current EE pose."""
-        if self.headless:
-            return
-
-        num_envs = self._num_envs
-        L = TARGET_AXIS_LENGTH
-
-        env_off = _compute_world_offsets(num_envs) * 2.0
-
-        # --- target axes (solid, bright) ---
-        target_pos_np = (
-            self.target_pos.cpu().numpy()
-            if isinstance(self.target_pos, torch.Tensor)
-            else np.array(self.target_pos)
-        )
-        target_quat_np = (
-            self.target_quat.cpu().numpy()
-            if isinstance(self.target_quat, torch.Tensor)
-            else np.array(self.target_quat)
-        )
-
-        t_begins = np.empty((num_envs * 3, 3), dtype=np.float32)
-        t_ends = np.empty((num_envs * 3, 3), dtype=np.float32)
-        t_colors = np.empty((num_envs * 3, 3), dtype=np.float32)
-
-        target_axis_colors = np.array(
-            [[1.0, 0.2, 0.2], [0.2, 1.0, 0.2], [0.2, 0.2, 1.0]], dtype=np.float32
-        )
-
-        for i in range(num_envs):
-            origin = target_pos_np[i] + env_off[i]
-            R = _quat_to_rotmat(target_quat_np[i])
-            base = i * 3
-            for ax in range(3):
-                t_begins[base + ax] = origin
-                t_ends[base + ax] = origin + R[:, ax] * L
-                t_colors[base + ax] = target_axis_colors[ax]
-
-        self.viewer.log_lines(
-            "/target_axes",
-            wp.array(t_begins, dtype=wp.vec3),
-            wp.array(t_ends, dtype=wp.vec3),
-            wp.array(t_colors, dtype=wp.vec3),
-            width=0.02,
-        )
-
-        # --- EE axes (darker, thinner) ---
-        # body_q_flat = wp.to_torch(self.state_0.body_q).cpu().numpy()  # [total_bodies, 7]
-        # ee_indices_np = self.ee_body_indices if isinstance(
-        #     self.ee_body_indices, np.ndarray
-        # ) else np.array(self.ee_body_indices)
-
-        # e_begins = np.empty((num_envs * 3, 3), dtype=np.float32)
-        # e_ends = np.empty((num_envs * 3, 3), dtype=np.float32)
-        # e_colors = np.empty((num_envs * 3, 3), dtype=np.float32)
-
-        # ee_axis_colors = np.array(
-        #     [[0.7, 0.0, 0.0], [0.0, 0.7, 0.0], [0.0, 0.0, 0.7]], dtype=np.float32
-        # )
-
-        # for i in range(num_envs):
-        #     ee_global = int(ee_indices_np[i])
-        #     ee_pose = body_q_flat[ee_global]
-        #     origin = ee_pose[:3] + env_off[i]
-        #     R = _quat_to_rotmat(ee_pose[3:7])
-        #     base = i * 3
-        #     for ax in range(3):
-        #         e_begins[base + ax] = origin
-        #         e_ends[base + ax] = origin + R[:, ax] * L
-        #         e_colors[base + ax] = ee_axis_colors[ax]
-
-        # self.viewer.log_lines(
-        #     "/ee_axes",
-        #     wp.array(e_begins, dtype=wp.vec3),
-        #     wp.array(e_ends, dtype=wp.vec3),
-        #     wp.array(e_colors, dtype=wp.vec3),
-        #     width=0.01,
-        # )
-
-    def close(self):
-        if self.viewer is not None:
-            self.viewer.close()
-            self.viewer = None
-
-    def _get_obs_detached(self):
-        """Get observation as detached tensor (for reset)."""
-        body_q_torch = wp.to_torch(self.state_0.body_q)
-        joint_q_torch = wp.to_torch(self.state_0.joint_q)
-
-        obs_list = []
-        for i in range(self._num_envs):
-            ee_global = int(self.ee_body_indices[i])
-            ee_transform = body_q_torch[ee_global]
-            eef_pos = ee_transform[:3]
-            eef_quat = ee_transform[3:7]
-
-            q_start = i * FRANKA_NUM_JOINTS
-            jpos = joint_q_torch[q_start : q_start + FRANKA_NUM_ARM_JOINTS]
-
-            target_pos_t = torch.tensor(
-                self.target_pos[i], dtype=torch.float32, device=self.device_str
-            )
-            target_quat_t = torch.tensor(
-                self.target_quat[i], dtype=torch.float32, device=self.device_str
-            )
-            obs_list.append(
-                torch.cat(
-                    [
-                        jpos,
-                        eef_pos,
-                        eef_quat,
-                        target_pos_t,
-                        target_quat_t,
-                        self.last_action[i],
-                    ]
-                )
-            )
-
-        return torch.stack(obs_list)
 
 
 if __name__ == "__main__":
     import time
 
     # Simple test: run random actions in the environment
-    env = FrankaReachVecEnv(num_envs=4, headless=False)
+    env = FrankaReachAPGEnv(num_envs=4, headless=False)
     obs, info = env.reset(seed=42)
     while True:
 
