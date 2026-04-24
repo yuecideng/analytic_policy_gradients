@@ -466,6 +466,10 @@ class FrankaReachVecEnv:
             self.arm_joint_limit_upper,
         )
 
+        newton.eval_fk(
+            self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
+        )
+
         obs = self._get_obs()
 
         rewards = self._get_rewards(actions)
@@ -538,9 +542,7 @@ class FrankaReachVecEnv:
     def _render_current_state(self) -> None:
         if self.viewer is None:
             return
-        newton.eval_fk(
-            self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
-        )
+
         self.viewer.begin_frame(self._sim_time)
         self.viewer.log_state(self.state_0)
         self._draw_axes()
@@ -657,19 +659,22 @@ class FrankaReachVecEnv:
 def _set_joint_targets_kernel(
     action: wp.array(dtype=wp.float32),  # [num_envs * 7] flat action
     current_q: wp.array(dtype=wp.float32),  # joint_q from state
-    target_pos: wp.array(dtype=wp.float32),  # control.joint_target
+    target_pos: wp.array(dtype=wp.float32),  # new joint_q output
+    joint_limit_lower: wp.array(dtype=wp.float32),  # [num_arm_joints]
+    joint_limit_upper: wp.array(dtype=wp.float32),  # [num_arm_joints]
     action_scale: wp.float32,
     num_joints_per_env: wp.int32,
     num_arm_joints: wp.int32,
     total_dims: wp.int32,  # num_envs * num_arm_joints
 ):
-    """Compute joint targets from delta actions: target = current + action * scale."""
+    """Compute joint targets: target = clamp(current + action * scale, lo, hi)."""
     tid = wp.tid()
     if tid < total_dims:
         env_idx = tid / num_arm_joints
         j = tid % num_arm_joints
         q_offset = env_idx * num_joints_per_env + j
-        target_pos[q_offset] = current_q[q_offset] + action[tid] * action_scale
+        new_q = current_q[q_offset] + action[tid] * action_scale
+        target_pos[q_offset] = wp.clamp(new_q, joint_limit_lower[j], joint_limit_upper[j])
 
 
 @wp.kernel
@@ -774,6 +779,8 @@ class _NewtonStepFunc(torch.autograd.Function):
         num_envs = sim_state["num_envs"]
         last_action_t = sim_state["last_action"]
         action_scale = sim_state["action_scale"]
+        joint_limit_lower_wp = sim_state["joint_limit_lower_wp"]
+        joint_limit_upper_wp = sim_state["joint_limit_upper_wp"]
 
         device_str = str(action_torch.device)
 
@@ -827,6 +834,8 @@ class _NewtonStepFunc(torch.autograd.Function):
                     action_wp,
                     state_joint_q,
                     new_joint_q,
+                    joint_limit_lower_wp,
+                    joint_limit_upper_wp,
                     wp.float32(action_scale),
                     wp.int32(num_joints_per_env),
                     wp.int32(FRANKA_NUM_ARM_JOINTS),
@@ -956,6 +965,16 @@ class FrankaReachAPGEnv(FrankaReachVecEnv):
             headless=headless,
             requires_grad=True,
         )
+        self._joint_limit_lower_wp = wp.array(
+            self.arm_joint_limit_lower.cpu().numpy().astype(np.float32),
+            dtype=wp.float32,
+            device=self.model.device,
+        )
+        self._joint_limit_upper_wp = wp.array(
+            self.arm_joint_limit_upper.cpu().numpy().astype(np.float32),
+            dtype=wp.float32,
+            device=self.model.device,
+        )
 
     def step(self, action):
         """Step all envs with differentiable reward. action: [num_envs, 7]."""
@@ -973,6 +992,8 @@ class FrankaReachAPGEnv(FrankaReachVecEnv):
             "num_envs": self._num_envs,
             "last_action": self.last_action,
             "action_scale": self.action_scale,
+            "joint_limit_lower_wp": self._joint_limit_lower_wp,
+            "joint_limit_upper_wp": self._joint_limit_upper_wp,
         }
 
         reward, obs, _ = _NewtonStepFunc.apply(action, sim_state)
