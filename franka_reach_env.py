@@ -38,12 +38,16 @@ DEFAULT_FINGER_Q = [0.0, 0.0]
 DEFAULT_JOINT_Q = DEFAULT_ARM_JOINT_Q + DEFAULT_FINGER_Q
 FRANKA_NUM_JOINTS = len(DEFAULT_JOINT_Q)
 
-# Target sampling workspace (in front of robot, reachable region)
+# Target sampling workspace — full feasible reach of Franka FR3 (~855mm reach).
+# x: forward from base; y: lateral; z: vertical (base joint at z≈0.333).
 TARGET_POS_RANGE = {
-    "x": (0.2, 0.4),
-    "y": (-0.1, 0.1),
-    "z": (0.4, 0.6),
+    "x": (0.05, 0.70),
+    "y": (-0.45, 0.45),
+    "z": (0.05, 0.95),
 }
+# Maximum tilt angle (radians) from the default downward orientation.
+# 0 = EE straight down; pi = any orientation.
+TARGET_MAX_TILT = math.pi / 3  # ±60°
 TARGET_AXIS_LENGTH = 0.1  # meters, length of each axis line for target visualization
 
 
@@ -219,7 +223,6 @@ def _build_franka_model(num_envs=1, requires_grad=False, device="cpu", urdf_path
         return model, ee_index
 
 
-# TODO: Check for correctness of target sampling.
 def _sample_target(num_envs, device="cpu"):
     """Sample random target poses within reachable workspace. Returns torch tensors."""
     target_pos = torch.zeros(num_envs, 3, dtype=torch.float32, device=device)
@@ -232,9 +235,36 @@ def _sample_target(num_envs, device="cpu"):
     target_pos[:, 2] = TARGET_POS_RANGE["z"][0] + torch.rand(
         num_envs, device=device
     ) * (TARGET_POS_RANGE["z"][1] - TARGET_POS_RANGE["z"][0])
-    # 180-degree rotation around X-axis: [1, 0, 0, 0]
-    target_quat = torch.zeros(num_envs, 4, dtype=torch.float32, device=device)
-    target_quat[:, 0] = 1.0
+
+    # Default orientation: EE pointing down (180° around X) → quat (x,y,z,w) = (1,0,0,0).
+    # Perturb with random tilt (bounded cone) + full rotation around the approach axis.
+    # Random rotation axis on XY plane (perpendicular to approach direction Z):
+    phi = torch.rand(num_envs, device=device) * 2 * math.pi
+    sin_phi = torch.sin(phi)
+    cos_phi = torch.cos(phi)
+    # Tilt angle sampled uniformly in cos(theta) for uniform cone sampling
+    tilt = torch.acos(
+        1.0 - torch.rand(num_envs, device=device) * (1.0 - math.cos(TARGET_MAX_TILT))
+    )
+    half_tilt = tilt / 2.0
+    sin_ht = torch.sin(half_tilt)
+    cos_ht = torch.cos(half_tilt)
+    # Delta quaternion from identity: q_delta = [sin_ht*cos_phi, sin_ht*sin_phi, 0, cos_ht]
+    q_delta = torch.stack([sin_ht * cos_phi, sin_ht * sin_phi,
+                           torch.zeros(num_envs, device=device), cos_ht], dim=-1)
+    # Base orientation (EE down): [1, 0, 0, 0]
+    q_base = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device).unsqueeze(0).expand(num_envs, -1)
+    # Quaternion multiply: q_result = q_delta * q_base
+    dx, dy, dz, dw = q_delta[:, 0], q_delta[:, 1], q_delta[:, 2], q_delta[:, 3]
+    bx, by, bz, bw = q_base[:, 0], q_base[:, 1], q_base[:, 2], q_base[:, 3]
+    target_quat = torch.stack([
+        dw * bx + dx * bw + dy * bz - dz * by,
+        dw * by - dx * bz + dy * bw + dz * bx,
+        dw * bz + dx * by - dy * bx + dz * bw,
+        dw * bw - dx * bx - dy * by - dz * bz,
+    ], dim=-1)
+    # Normalize
+    target_quat = target_quat / target_quat.norm(dim=-1, keepdim=True)
     return target_pos, target_quat
 
 

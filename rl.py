@@ -679,7 +679,7 @@ if __name__ == "__main__":
                 all_rewards = []
                 all_obs_for_norm = []
 
-                for step in range(args.num_steps):
+                for step in range(args.max_episode_steps):
                     global_step += args.num_envs
 
                     # Normalize with frozen stats; collect raw obs for post-rollout update
@@ -723,11 +723,12 @@ if __name__ == "__main__":
                 # Update obs normalizer with all obs from this rollout (frozen during forward)
                 obs_normalizer.update(torch.cat(all_obs_for_norm, dim=0))
 
-                # Undiscounted return loss: sum over time steps, mean over envs.
-                # Using sum(dim=0) instead of .mean() decouples gradient magnitude
-                # from num_steps, so changing the horizon doesn't implicitly rescale LR.
+                # Discounted return loss: average over both time and env dims
                 all_rewards_t = torch.stack(all_rewards)  # [num_steps, num_envs]
-                loss = -(all_rewards_t.sum(dim=0).mean())
+                num_steps = all_rewards_t.shape[0]
+                discounts = args.gamma ** torch.arange(num_steps, device=device, dtype=torch.float32)
+                discounted = all_rewards_t * discounts.unsqueeze(1)  # [num_steps, num_envs]
+                loss = -(discounted.sum(dim=0).mean())
 
                 loss.backward()
 
