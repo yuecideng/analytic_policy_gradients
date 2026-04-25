@@ -8,6 +8,7 @@
 #   PPO (discrete):   python ppo.py --algorithm ppo --env_id CartPole-v1
 #   PPO (continuous):  python ppo.py --algorithm ppo --env_id Pendulum-v1
 #   APG:               python ppo.py --algorithm apg --env_id <your-diff-env>
+import math
 import os
 import sys
 import time
@@ -46,7 +47,7 @@ class Args:
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = False
+    capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     headless: bool = True
     """whether to run custom environments without an interactive viewer window"""
@@ -110,6 +111,14 @@ class Args:
     """per-parameter gradient clipping before optimizer"""
     apg_ent_coef: float = 0.0
     """coefficient of the entropy bonus for APG (0 = disabled, 0.01 = match PPO default)"""
+    apg_segment_length: int = 0
+    """segment length for value bootstrapping (0 = max_episode_steps, backward compat)"""
+    apg_bootstrap: str = "mc"
+    """bootstrap mode for segmented APG: 'mc' uses collected future rewards, 'critic' uses learned V(s)"""
+    apg_critic_coef: float = 0.5
+    """coefficient of the critic loss for segmented APG (only used with --apg_bootstrap critic)"""
+    apg_critic_lr: Optional[float] = None
+    """separate learning rate for critic (None = use policy LR, only used with --apg_bootstrap critic)"""
 
     # Comparison
     max_episode_steps: int = 30
@@ -196,8 +205,9 @@ def make_custom_vec_env(env_id, num_envs, algorithm, device, headless, max_episo
         return factory(**kw)
 
 
-def _create_eval_envs(args, device):
+def _create_eval_envs(args, device, run_name=""):
     """Create a separate eval environment (black-box, no gradients needed)."""
+    video_dir = f"videos/{run_name}" if args.capture_video else "videos"
     eval_envs = make_custom_vec_env(
         env_id=args.env_id,
         num_envs=args.num_envs,
@@ -205,6 +215,8 @@ def _create_eval_envs(args, device):
         device=device,
         headless=True,
         max_episode_steps=args.max_episode_steps,
+        capture_video=args.capture_video,
+        video_dir=video_dir,
     )
     if eval_envs is not None:
         return eval_envs
@@ -266,6 +278,10 @@ def deterministic_eval(agent, obs_normalizer, args, device, eval_envs, writer, g
         writer.add_scalar("by_grad_steps/eval_return", mean_ret, total_grad_steps)
         print(f"  eval (step={global_step}): return={mean_ret:.5f}, length={mean_len:.1f} "
               f"({n} episodes)")
+    # Flush any remaining recorded frames as a video
+    if hasattr(eval_envs, "video_recorder") and eval_envs.video_recorder is not None:
+        eval_envs.video_recorder.on_episode_end(global_step)
+    if completed_returns:
         return mean_ret
     return None
 
@@ -437,7 +453,7 @@ def _run_training(args, seed):
         device=device,
         headless=args.headless,
         max_episode_steps=args.max_episode_steps,
-        capture_video=args.capture_video,
+        capture_video=False,
         video_dir=f"videos/{run_name}",
     )
     if custom_envs is not None:
@@ -462,7 +478,7 @@ def _run_training(args, seed):
     agent = Agent(envs, use_layernorm=True).to(device)
 
     # Eval env setup (separate from training env)
-    eval_envs = _create_eval_envs(args, device) if args.eval_freq > 0 else None
+    eval_envs = _create_eval_envs(args, device, run_name) if args.eval_freq > 0 else None
 
     # optimizer setup
     if args.algorithm == "ppo":
@@ -472,11 +488,22 @@ def _run_training(args, seed):
             eps=1e-5,
         )
     else:
-        optimizer = optim.Adam(
-            agent.actor_parameters(),
-            lr=args.learning_rate,
-            eps=1e-5,
-        )
+        # Determine if segmented APG with critic bootstrap is active
+        effective_seg = args.apg_segment_length if args.apg_segment_length > 0 else args.max_episode_steps
+        use_critic = effective_seg < args.max_episode_steps and args.apg_bootstrap == "critic"
+
+        if use_critic:
+            critic_lr = args.apg_critic_lr if args.apg_critic_lr is not None else args.learning_rate
+            optimizer = optim.Adam([
+                {"params": agent.actor_parameters(), "lr": args.learning_rate},
+                {"params": list(agent.critic.parameters()), "lr": critic_lr},
+            ], eps=1e-5)
+        else:
+            optimizer = optim.Adam(
+                agent.actor_parameters(),
+                lr=args.learning_rate,
+                eps=1e-5,
+            )
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -734,123 +761,208 @@ def _run_training(args, seed):
             if args.anneal_lr:
                 frac = 1.0 - (iteration - 1.0) / args.num_iterations
                 optimizer.param_groups[0]["lr"] = frac * args.learning_rate
+                if use_critic and len(optimizer.param_groups) > 1:
+                    init_critic_lr = args.apg_critic_lr or args.learning_rate
+                    optimizer.param_groups[1]["lr"] = frac * init_critic_lr
 
             for grad_step in range(args.apg_num_grad_steps):
                 total_grad_steps += 1
 
                 optimizer.zero_grad()
 
-                # Collect rewards and obs over the short horizon.
-                # Obs is collected here and used to update the normalizer after the
-                # rollout (frozen stats during the forward pass avoids non-stationary
-                # normalization within the computation graph).
-                all_rewards = []
+                effective_seg = args.apg_segment_length if args.apg_segment_length > 0 else args.max_episode_steps
+                num_segments = math.ceil(args.max_episode_steps / effective_seg)
+                use_seg = effective_seg < args.max_episode_steps
+
+                policy_loss = torch.tensor(0.0, device=device)
                 all_obs_for_norm = []
                 all_entropies = []
 
-                for step in range(args.max_episode_steps):
-                    global_step += args.num_envs
+                # Per-segment storage
+                seg_rewards_all = []       # list of lists of [num_envs] reward tensors
+                seg_norm_obs_end = []      # normalized obs at end of each segment (for critic)
+                seg_norm_obs_start = []    # normalized obs at start of each segment (for critic)
+                seg_steps_list = []        # actual steps per segment
 
-                    # Normalize with frozen stats; collect raw obs for post-rollout update
-                    norm_obs = obs_normalizer.normalize(obs)
-                    all_obs_for_norm.append(obs.detach())
+                # ===== Segmented forward pass =====
+                for seg_idx in range(num_segments):
+                    seg_start = seg_idx * effective_seg
+                    seg_end = min(seg_start + effective_seg, args.max_episode_steps)
+                    seg_steps = seg_end - seg_start
+                    seg_steps_list.append(seg_steps)
 
-                    # Differentiable action — gradients flow through into the environment
-                    action = agent.get_apg_action(norm_obs, temp=temp)
+                    seg_norm_obs_start.append(obs_normalizer.normalize(obs.detach()))
 
-                    # Compute entropy for optional regularization bonus
-                    if args.apg_ent_coef > 0:
-                        dist = agent._get_dist(norm_obs)
-                        if agent.discrete:
-                            ent = dist.entropy()
-                        else:
-                            ent = dist.entropy().sum(-1)
-                        all_entropies.append(ent)
+                    segment_rewards = []
+                    for step in range(seg_steps):
+                        global_step += args.num_envs
 
-                    # Step through differentiable environment (computation graph preserved)
-                    obs, reward, terminated, truncated, infos = envs.step(action)
-                    obs = obs.to(device)
-                    reward = reward.to(device)
-                    terminated = terminated.to(device)
-                    truncated = truncated.to(device)
-                    done = (terminated | truncated).float()
+                        norm_obs = obs_normalizer.normalize(obs)
+                        all_obs_for_norm.append(obs.detach())
 
-                    all_rewards.append(reward.view(-1))
+                        action = agent.get_apg_action(norm_obs, temp=temp)
 
-                    current_ep_ret += reward.detach().view(-1)
-                    current_ep_len += 1
+                        if args.apg_ent_coef > 0:
+                            dist = agent._get_dist(norm_obs)
+                            if agent.discrete:
+                                ent = dist.entropy()
+                            else:
+                                ent = dist.entropy().sum(-1)
+                            all_entropies.append(ent)
 
-                    done_mask = done.bool()
-                    num_done = done_mask.sum().item()
-                    if num_done > 0:
-                        episode_count += num_done
-                        avg_ret = current_ep_ret[done_mask].mean().item()
-                        avg_len = current_ep_len[done_mask].mean().item()
-                        writer.add_scalar("charts/episodic_return", avg_ret, global_step)
-                        writer.add_scalar("charts/episodic_length", avg_len, global_step)
-                        if (
-                            should_print_episodes
-                            and episode_count % args.print_every_n_episodes == 0
+                        obs, reward, terminated, truncated, infos = envs.step(action)
+                        obs = obs.to(device)
+                        reward = reward.to(device)
+                        terminated = terminated.to(device)
+                        truncated = truncated.to(device)
+                        done = (terminated | truncated).float()
+
+                        segment_rewards.append(reward.view(-1))
+
+                        current_ep_ret += reward.detach().view(-1)
+                        current_ep_len += 1
+
+                        done_mask = done.bool()
+                        num_done = done_mask.sum().item()
+                        if num_done > 0:
+                            episode_count += num_done
+                            avg_ret = current_ep_ret[done_mask].mean().item()
+                            avg_len = current_ep_len[done_mask].mean().item()
+                            writer.add_scalar("charts/episodic_return", avg_ret, global_step)
+                            writer.add_scalar("charts/episodic_length", avg_len, global_step)
+                            if (
+                                should_print_episodes
+                                and episode_count % args.print_every_n_episodes == 0
+                            ):
+                                print(f"global_step={global_step}, episodic_return={avg_ret:.5f}, episodic_length={avg_len}")
+
+                        current_ep_ret[done_mask] = 0.0
+                        current_ep_len[done_mask] = 0.0
+
+                    seg_rewards_all.append(segment_rewards)
+                    seg_norm_obs_end.append(obs_normalizer.normalize(obs.detach()))
+
+                    # Detach at segment boundary — limits gradient chain to seg_steps
+                    obs = obs.detach()
+                    if hasattr(envs, "detach_state"):
+                        envs.detach_state()
+                    else:
+                        for attr in (
+                            "block_pos", "block_angle", "block_vel",
+                            "block_ang_vel", "last_action",
                         ):
-                            print(f"global_step={global_step}, episodic_return={avg_ret:.5f}, episodic_length={avg_len}")
+                            t = getattr(envs, attr, None)
+                            if isinstance(t, torch.Tensor):
+                                setattr(envs, attr, t.detach())
 
-                    # Reset tracking for done environments
-                    current_ep_ret[done_mask] = 0.0
-                    current_ep_len[done_mask] = 0.0
-
-                # Update obs normalizer with all obs from this rollout (frozen during forward)
+                # Update obs normalizer
                 obs_normalizer.update(torch.cat(all_obs_for_norm, dim=0))
 
-                # Discounted return loss: average over both time and env dims
-                all_rewards_t = torch.stack(all_rewards)  # [num_steps, num_envs]
-                num_steps = all_rewards_t.shape[0]
-                discounts = args.gamma ** torch.arange(num_steps, device=device, dtype=torch.float32)
-                discounted = all_rewards_t * discounts.unsqueeze(1)  # [num_steps, num_envs]
-                loss = -(discounted.sum(dim=0).mean())
+                # ===== Compute per-segment returns and bootstrap =====
+                critic_values_list = []
+                critic_targets_list = []
 
-                # Optional entropy bonus (matches PPO convention: maximize entropy)
+                # Pre-compute MC future returns (backwards accumulation)
+                mc_future = [None] * num_segments
+                if use_seg and args.apg_bootstrap == "mc":
+                    running_future = torch.zeros(args.num_envs, device=device)
+                    for seg_idx in reversed(range(num_segments)):
+                        mc_future[seg_idx] = running_future.clone()
+                        seg_steps = seg_steps_list[seg_idx]
+                        running_future = running_future * (args.gamma ** seg_steps)
+                        for t, r in enumerate(seg_rewards_all[seg_idx]):
+                            running_future = running_future + r.detach() * (args.gamma ** t)
+
+                # Build per-segment losses
+                for seg_idx in range(num_segments):
+                    seg_steps = seg_steps_list[seg_idx]
+                    seg_rewards_t = torch.stack(seg_rewards_all[seg_idx])
+                    discounts = args.gamma ** torch.arange(seg_steps, device=device, dtype=torch.float32)
+                    seg_return = (seg_rewards_t * discounts.unsqueeze(1)).sum(dim=0)
+
+                    is_last = seg_idx == num_segments - 1
+                    if not is_last and use_seg:
+                        if args.apg_bootstrap == "mc":
+                            bootstrap_value = mc_future[seg_idx]
+                        elif args.apg_bootstrap == "critic":
+                            bootstrap_value = (args.gamma ** seg_steps) * agent.get_value(
+                                seg_norm_obs_end[seg_idx]
+                            ).squeeze(-1).detach()
+                        else:
+                            bootstrap_value = torch.zeros(args.num_envs, device=device)
+                    else:
+                        bootstrap_value = torch.zeros(args.num_envs, device=device)
+
+                    policy_loss = policy_loss - (seg_return + bootstrap_value).mean()
+
+                    # Collect critic training data
+                    if use_seg and args.apg_bootstrap == "critic":
+                        with torch.no_grad():
+                            critic_pred = agent.get_value(seg_norm_obs_start[seg_idx]).squeeze(-1)
+                        critic_values_list.append(critic_pred)
+                        critic_targets_list.append((seg_return + bootstrap_value).detach())
+
+                # ===== Critic loss =====
+                if use_seg and args.apg_bootstrap == "critic" and len(critic_values_list) > 0:
+                    critic_values_t = torch.cat(critic_values_list)
+                    critic_targets_t = torch.cat(critic_targets_list)
+                    critic_loss = F.mse_loss(critic_values_t, critic_targets_t)
+                else:
+                    critic_loss = torch.tensor(0.0, device=device)
+
+                # ===== Total loss =====
+                loss = policy_loss + args.apg_critic_coef * critic_loss
+
                 if args.apg_ent_coef > 0 and all_entropies:
                     entropy_loss = torch.stack(all_entropies).mean()
                     loss = loss - args.apg_ent_coef * entropy_loss
 
                 loss.backward()
 
-                # Global norm clipping
                 nn.utils.clip_grad_norm_(
                     agent.actor_parameters(), args.max_grad_norm
                 )
+                if use_seg and args.apg_bootstrap == "critic":
+                    nn.utils.clip_grad_norm_(agent.critic.parameters(), args.max_grad_norm)
                 optimizer.step()
-
-                # Detach obs and env internal state to break computation graph
-                # between gradient steps.  Env state carries forward numerically,
-                # but the autograd tape is cut so the next grad step starts fresh.
-                obs = obs.detach()
-                if hasattr(envs, "detach_state"):
-                    envs.detach_state()
-                else:
-                    for attr in (
-                        "block_pos", "block_angle", "block_vel",
-                        "block_ang_vel", "last_action",
-                    ):
-                        t = getattr(envs, attr, None)
-                        if isinstance(t, torch.Tensor):
-                            setattr(envs, attr, t.detach())
 
             # Logging (once per iteration, after all grad steps)
             # Multi-axis logging for fair PPO vs APG comparison
             elapsed = time.time() - start_time
             iter_elapsed = time.time() - iter_start_time
+
+            # Compute total reward across all segments for logging
+            total_reward = sum(
+                r.sum().item() for seg in seg_rewards_all for r in seg
+            )
+            horizon_return = total_reward / envs.num_envs
+
             writer.add_scalar(
                 "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
             )
             writer.add_scalar(
-                "apg/horizon_return", all_rewards_t.sum().item() / envs.num_envs, global_step
+                "apg/horizon_return", horizon_return, global_step
             )
             writer.add_scalar("apg/total_loss", loss.item(), global_step)
             if args.apg_ent_coef > 0 and all_entropies:
                 writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
             if agent.discrete:
                 writer.add_scalar("apg/gumbel_temperature", temp, global_step)
+
+            # Segmented APG metrics
+            effective_seg_log = args.apg_segment_length if args.apg_segment_length > 0 else args.max_episode_steps
+            use_seg_log = effective_seg_log < args.max_episode_steps
+            if use_seg_log:
+                writer.add_scalar("apg/num_segments", num_segments, global_step)
+                writer.add_scalar("apg/bootstrap_mode", 0.0 if args.apg_bootstrap == "mc" else 1.0, global_step)
+                if args.apg_bootstrap == "critic":
+                    writer.add_scalar("apg/critic_loss", critic_loss.item(), global_step)
+                    if critic_values_list:
+                        critic_val_mean = torch.cat(critic_values_list).mean().item()
+                        critic_tgt_mean = torch.cat(critic_targets_list).mean().item()
+                        writer.add_scalar("apg/critic_value_mean", critic_val_mean, global_step)
+                        writer.add_scalar("apg/critic_target_mean", critic_tgt_mean, global_step)
+
             writer.add_scalar(
                 "charts/SPS", int(global_step / elapsed), global_step
             )
@@ -861,7 +973,7 @@ def _run_training(args, seed):
             # Log key metrics keyed by grad_steps and wall_time too
             writer.add_scalar("by_grad_steps/learning_rate", optimizer.param_groups[0]["lr"], total_grad_steps)
             writer.add_scalar("by_grad_steps/total_loss", loss.item(), total_grad_steps)
-            writer.add_scalar("by_grad_steps/horizon_return", all_rewards_t.sum().item() / envs.num_envs, total_grad_steps)
+            writer.add_scalar("by_grad_steps/horizon_return", horizon_return, total_grad_steps)
             writer.add_scalar("by_wall_time/learning_rate", optimizer.param_groups[0]["lr"], elapsed)
 
             # Deterministic evaluation

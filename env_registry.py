@@ -33,12 +33,40 @@ try:
 except ImportError:
     _franka_spec = None
 
+try:
+    from push_t_env import PushTAPGEnv, PushTVecEnv
+
+    _pusht_spec = EnvSpec(
+        ppo_factory=lambda **kw: PushTVecEnv(**kw),
+        apg_factory=lambda **kw: PushTAPGEnv(**kw),
+    )
+except ImportError:
+    _pusht_spec = None
+
+try:
+    from point_mass_env import PointMassAPGEnv, PointMassVecEnv
+
+    _pointmass_spec = EnvSpec(
+        ppo_factory=lambda **kw: PointMassVecEnv(**kw),
+        apg_factory=lambda **kw: PointMassAPGEnv(**kw),
+    )
+except ImportError:
+    _pointmass_spec = None
+
 
 IMPLEMENTED_ENVS: Dict[str, EnvSpec] = {}
 
 # Register FrankaReach only if the dependency is available.
 if _franka_spec is not None:
     IMPLEMENTED_ENVS["FrankaReach-v0"] = _franka_spec
+
+# Register PushT (pure PyTorch, no heavy deps — always available).
+if _pusht_spec is not None:
+    IMPLEMENTED_ENVS["PushT-v0"] = _pusht_spec
+
+# Register PointMassNavigate (pure PyTorch, no heavy deps — always available).
+if _pointmass_spec is not None:
+    IMPLEMENTED_ENVS["PointMassNavigate-v0"] = _pointmass_spec
 
 
 def _register_gym_envs():
