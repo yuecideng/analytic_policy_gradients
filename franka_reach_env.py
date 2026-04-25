@@ -321,8 +321,6 @@ class FrankaReachVecEnv:
             requires_grad=requires_grad,
             device=device,
         )
-        if not requires_grad:
-            self.solver = newton.solvers.SolverFeatherstone(self.model)
 
         self.state_0 = self.model.state()
 
@@ -405,7 +403,7 @@ class FrankaReachVecEnv:
             else torch.arange(self._num_envs, device=self.device)
         )
 
-        self.step_count[:] = 0
+        self.step_count[local_env_ids] = 0
 
         # Randomize arm joints by scale in [0.5, 1.5] around default (IsaacLab reset_joints_by_scale).
         default_arm_q = torch.tensor(
@@ -678,34 +676,6 @@ def _set_joint_targets_kernel(
 
 
 @wp.kernel
-def _compute_reward_kernel(
-    body_q: wp.array(dtype=wp.transformf),
-    ee_body_indices: wp.array(dtype=wp.int32),
-    target_pos: wp.array(dtype=wp.vec3f),
-    reward_out: wp.array(dtype=wp.float32),
-):
-    """IsaacLab-style position reward (fully differentiable).
-
-    reward = -0.2 * pos_dist + 0.1 * (1 - tanh(pos_dist / 0.1))
-    """
-    env_idx = wp.tid()
-    ee_global = ee_body_indices[env_idx]
-
-    ee_transform = body_q[ee_global]
-    eef_pos = wp.transform_get_translation(ee_transform)
-
-    t_pos = target_pos[env_idx]
-
-    diff = eef_pos - t_pos
-    pos_dist_sq = wp.dot(diff, diff)
-    pos_dist = wp.sqrt(pos_dist_sq + wp.float32(1e-8))
-
-    reward_out[env_idx] = wp.float32(-0.2) * pos_dist + wp.float32(0.1) * (
-        wp.float32(1.0) - wp.tanh(pos_dist / wp.float32(0.1))
-    )
-
-
-@wp.kernel
 def _compute_full_reward_kernel(
     body_q: wp.array(dtype=wp.transformf),
     ee_body_indices: wp.array(dtype=wp.int32),
@@ -765,8 +735,13 @@ class _NewtonStepFunc(torch.autograd.Function):
     the control input. The differentiable path is:
         action → joint_q → FK → body_q → EEF pose → reward
 
-    Forward: runs FK inside Warp tape, returns reward + obs.
+    Forward: runs FK inside Warp tape, returns reward + EEF poses (detached).
     Backward: uses stored Warp tape to compute d(reward)/d(action).
+
+    Obs construction is intentionally left to the caller (FrankaReachAPGEnv.step)
+    so that the joint-position component can be computed in PyTorch, giving a
+    differentiable obs[:, :7] and enabling multi-step credit assignment through
+    the jpos state.
     """
 
     @staticmethod
@@ -870,56 +845,23 @@ class _NewtonStepFunc(torch.autograd.Function):
         # Extract results
         reward_t = wp.to_torch(reward_wp).detach().clone()
 
-        # Build observation (detached)
-        body_q_torch = wp.to_torch(fk_state.body_q)
-        joint_q_torch = wp.to_torch(new_joint_q)
-        ee_indices_np = wp.to_torch(ee_indices_wp).numpy()
-
-        obs_list = []
-        for i in range(num_envs):
-            ee_global = int(ee_indices_np[i])
-            ee_transform = body_q_torch[ee_global]
-            eef_pos = ee_transform[:3]
-            eef_quat = ee_transform[3:7]
-
-            q_start = i * FRANKA_NUM_JOINTS
-            jpos = joint_q_torch[q_start : q_start + FRANKA_NUM_ARM_JOINTS]
-
-            target_pos_i = torch.tensor(
-                target_pos_list[i], dtype=torch.float32, device=device_str
-            )
-            target_quat_i = torch.tensor(
-                target_quat_list[i], dtype=torch.float32, device=device_str
-            )
-            obs_list.append(
-                torch.cat(
-                    [
-                        jpos,
-                        eef_pos,
-                        eef_quat,
-                        target_pos_i,
-                        target_quat_i,
-                        last_action_t[i].to(device_str),
-                    ]
-                )
-            )
-
-        obs_torch = torch.stack(obs_list).detach()
+        # EEF poses from FK (detached — gradient through eef requires a second
+        # Warp tape pass and is left for future work; jpos gradient is handled
+        # in PyTorch by the caller)
+        body_q_torch = wp.to_torch(fk_state.body_q)       # [total_bodies, 7]
+        ee_indices_t = wp.to_torch(ee_indices_wp).long()   # [num_envs]
+        eef_poses = body_q_torch[ee_indices_t].detach()    # [num_envs, 7]
 
         # Save for backward
         ctx.tape = tape
         ctx.action_wp = action_wp
         ctx.reward_wp = reward_wp
 
-        return (
-            reward_t,
-            obs_torch,
-            torch.zeros(num_envs, dtype=torch.bool, device=device_str),
-        )
+        return reward_t, eef_poses
 
     @staticmethod
-    def backward(ctx, grad_reward, grad_obs, grad_terminated):
-        # Set incoming gradient on the reward Warp array
+    def backward(ctx, grad_reward, grad_eef_poses):
+        # grad_eef_poses is ignored (eef_poses was detached in forward)
         grad_reward_wp = wp.from_torch(
             grad_reward.detach().clone().contiguous(), dtype=wp.float32
         )
@@ -996,7 +938,20 @@ class FrankaReachAPGEnv(FrankaReachVecEnv):
             "joint_limit_upper_wp": self._joint_limit_upper_wp,
         }
 
-        reward, obs, _ = _NewtonStepFunc.apply(action, sim_state)
+        reward, eef_poses = _NewtonStepFunc.apply(action, sim_state)
+
+        # Differentiable joint positions in PyTorch — same values as Warp's new_joint_q
+        # but connected to `action` via PyTorch autograd.  This enables multi-step
+        # credit assignment through the jpos component of obs.
+        # Read current joint positions (before the physics update below).
+        current_q = (
+            wp.to_torch(self.state_0.joint_q)
+            .view(self._num_envs, FRANKA_NUM_JOINTS)[:, :FRANKA_NUM_ARM_JOINTS]
+            .detach()
+        )
+        new_jpos = (current_q + action * self.action_scale).clamp(
+            self.arm_joint_limit_lower, self.arm_joint_limit_upper
+        )
 
         # Update env state for next step (detached from computation graph)
         with torch.no_grad():
@@ -1012,16 +967,27 @@ class FrankaReachAPGEnv(FrankaReachVecEnv):
         self._sim_time += self.frame_dt
         self._render_current_state()
 
+        # Build obs: jpos is differentiable through action; eef/target/last_action detached.
+        obs = torch.cat([
+            new_jpos,
+            eef_poses,
+            self.target_pos,
+            self.target_quat,
+            self.last_action,
+        ], dim=-1)
+
         truncated = self.step_count >= self.max_episode_steps
         terminated = self._check_success()
         done_mask = truncated | terminated
 
-        infos = {}
         if done_mask.any():
             reset_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
-            obs, _ = self.reset(reset_ids)
+            self.reset(reset_ids)
+            # Replace done envs with fresh detached obs; preserve gradient for live envs.
+            fresh_obs = self._get_obs()
+            obs = torch.where(done_mask.unsqueeze(-1).expand_as(obs), fresh_obs, obs)
 
-        return obs, reward, terminated, truncated, infos
+        return obs, reward, terminated, truncated, {}
 
 
 if __name__ == "__main__":
@@ -1029,10 +995,15 @@ if __name__ == "__main__":
 
     # Simple test: run random actions in the environment
     env = FrankaReachAPGEnv(num_envs=4, headless=False)
+    env_apg = FrankaReachAPGEnv(num_envs=4, headless=False)
     obs, info = env.reset(seed=42)
-    while True:
+    obs_apg, info_apg = env_apg.reset(seed=42)
 
-        action = torch.randn(env.num_envs, FRANKA_NUM_ARM_JOINTS)
-        obs, reward, terminated, truncated, infos = env.step(action)
-        print(f"Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}")
+    action = torch.randn(env.num_envs, FRANKA_NUM_ARM_JOINTS)
+    obs, reward, terminated, truncated, infos = env.step(action)
+    obs_apg, reward_apg, terminated_apg, truncated_apg, infos_apg = env_apg.step(
+        action
+    )
+    from IPython import embed; embed()
     env.close()
+    env_apg.close()
