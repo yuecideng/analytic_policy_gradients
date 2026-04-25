@@ -108,12 +108,22 @@ class Args:
     """number of gradient steps per iteration"""
     apg_per_param_clip: float = 1.0
     """per-parameter gradient clipping before optimizer"""
+    apg_ent_coef: float = 0.0
+    """coefficient of the entropy bonus for APG (0 = disabled, 0.01 = match PPO default)"""
 
     # Comparison
     max_episode_steps: int = 30
     """max episode steps for custom environments"""
-    equalize_grad_steps: bool = True
+    equalize_grad_steps: bool = False
     """scale APG iterations so total gradient steps match PPO"""
+
+    # Seed sweep & evaluation
+    num_seeds: int = 1
+    """number of seeds to sweep (runs training N times with seeds 1..N)"""
+    eval_freq: int = 0
+    """evaluate every N iterations (0 = disabled)"""
+    eval_episodes: int = 10
+    """number of episodes per deterministic evaluation"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -184,6 +194,80 @@ def make_custom_vec_env(env_id, num_envs, algorithm, device, headless, max_episo
         return factory(**kw, capture_video=capture_video, video_dir=video_dir)
     except TypeError:
         return factory(**kw)
+
+
+def _create_eval_envs(args, device):
+    """Create a separate eval environment (black-box, no gradients needed)."""
+    eval_envs = make_custom_vec_env(
+        env_id=args.env_id,
+        num_envs=args.num_envs,
+        algorithm="ppo",  # Always use black-box factory for eval
+        device=device,
+        headless=True,
+        max_episode_steps=args.max_episode_steps,
+    )
+    if eval_envs is not None:
+        return eval_envs
+    # Fallback for standard gymnasium envs
+    from torch_wrapper_env import TorchWrapperEnv
+    gym_envs = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, i, False, "") for i in range(args.num_envs)],
+    )
+    return TorchWrapperEnv(gym_envs)
+
+
+def deterministic_eval(agent, obs_normalizer, args, device, eval_envs, writer, global_step, total_grad_steps):
+    """Run deterministic evaluation episodes and log results."""
+    completed_returns = []
+    completed_lengths = []
+
+    obs, _ = eval_envs.reset()
+    obs = obs.to(device)
+    ep_ret = torch.zeros(eval_envs.num_envs, dtype=torch.float32, device=device)
+    ep_len = torch.zeros(eval_envs.num_envs, dtype=torch.int64, device=device)
+
+    max_steps = args.max_episode_steps * max(3, args.eval_episodes // eval_envs.num_envs + 1)
+
+    for _ in range(max_steps):
+        with torch.no_grad():
+            norm_obs = obs_normalizer.normalize(obs)
+            if agent.discrete:
+                action = agent.actor(norm_obs).argmax(dim=-1)
+            else:
+                action = agent.actor_mean(norm_obs).clamp(-1.0, 1.0)
+
+        obs, reward, terminated, truncated, _ = eval_envs.step(action)
+        obs = obs.to(device)
+        reward = reward.to(device)
+        terminated = terminated.to(device)
+        truncated = truncated.to(device)
+
+        ep_ret += reward.view(-1).detach()
+        ep_len += 1
+
+        done_mask = (terminated | truncated).bool()
+        if done_mask.any():
+            indices = done_mask.nonzero(as_tuple=False).squeeze(-1)
+            for i in indices:
+                completed_returns.append(ep_ret[i].item())
+                completed_lengths.append(ep_len[i].item())
+            ep_ret[done_mask] = 0.0
+            ep_len[done_mask] = 0
+
+        if len(completed_returns) >= args.eval_episodes:
+            break
+
+    if completed_returns:
+        n = min(len(completed_returns), args.eval_episodes)
+        mean_ret = np.mean(completed_returns[:n])
+        mean_len = np.mean(completed_lengths[:n])
+        writer.add_scalar("eval/episodic_return", mean_ret, global_step)
+        writer.add_scalar("eval/episodic_length", mean_len, global_step)
+        writer.add_scalar("by_grad_steps/eval_return", mean_ret, total_grad_steps)
+        print(f"  eval (step={global_step}): return={mean_ret:.5f}, length={mean_len:.1f} "
+              f"({n} episodes)")
+        return mean_ret
+    return None
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -309,25 +393,9 @@ class Agent(nn.Module):
             return list(self.actor_mean.parameters()) + [self.actor_log_std]
 
 
-if __name__ == "__main__":
-    args = tyro.cli(Args, args=_normalize_cli_args(sys.argv[1:]))
-    args.batch_size = int(args.num_envs * args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    if args.algorithm == "apg":
-        apg_batch_size = int(args.num_envs * args.num_steps * args.apg_num_grad_steps)
-
-        args.num_iterations = args.total_timesteps // apg_batch_size
-        if args.equalize_grad_steps:
-            ppo_grads_per_iter = args.update_epochs * args.num_minibatches
-            apg_grads_per_iter = args.apg_num_grad_steps
-            ppo_iters = args.total_timesteps // args.batch_size
-            args.num_iterations = ppo_iters * ppo_grads_per_iter // apg_grads_per_iter
-            print(f"equalize_grad_steps: scaling APG to {args.num_iterations} iterations "
-                  f"(PPO would have {ppo_iters} iters × {ppo_grads_per_iter} grads = "
-                  f"{ppo_iters * ppo_grads_per_iter} total grad steps)")
-    else:
-        args.num_iterations = args.total_timesteps // args.batch_size
-    print(f"minibatch_size={args.minibatch_size}, num_iterations={args.num_iterations}")
+def _run_training(args, seed):
+    """Run a single training experiment with the given seed."""
+    args.seed = seed
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -392,6 +460,9 @@ if __name__ == "__main__":
     ), "only discrete and box action spaces are supported"
 
     agent = Agent(envs, use_layernorm=True).to(device)
+
+    # Eval env setup (separate from training env)
+    eval_envs = _create_eval_envs(args, device) if args.eval_freq > 0 else None
 
     # optimizer setup
     if args.algorithm == "ppo":
@@ -625,6 +696,10 @@ if __name__ == "__main__":
             writer.add_scalar("by_grad_steps/total_loss", loss.item(), total_grad_steps)
             writer.add_scalar("by_wall_time/learning_rate", optimizer.param_groups[0]["lr"], elapsed)
 
+            # Deterministic evaluation
+            if eval_envs is not None and iteration % args.eval_freq == 0:
+                deterministic_eval(agent, obs_normalizer, args, device, eval_envs, writer, global_step, total_grad_steps)
+
     elif args.algorithm == "apg":
         # ========== APG Training Loop ==========
         # Short undiscounted rollouts with stateful training (carrying env state
@@ -671,6 +746,7 @@ if __name__ == "__main__":
                 # normalization within the computation graph).
                 all_rewards = []
                 all_obs_for_norm = []
+                all_entropies = []
 
                 for step in range(args.max_episode_steps):
                     global_step += args.num_envs
@@ -681,6 +757,15 @@ if __name__ == "__main__":
 
                     # Differentiable action — gradients flow through into the environment
                     action = agent.get_apg_action(norm_obs, temp=temp)
+
+                    # Compute entropy for optional regularization bonus
+                    if args.apg_ent_coef > 0:
+                        dist = agent._get_dist(norm_obs)
+                        if agent.discrete:
+                            ent = dist.entropy()
+                        else:
+                            ent = dist.entropy().sum(-1)
+                        all_entropies.append(ent)
 
                     # Step through differentiable environment (computation graph preserved)
                     obs, reward, terminated, truncated, infos = envs.step(action)
@@ -723,6 +808,11 @@ if __name__ == "__main__":
                 discounted = all_rewards_t * discounts.unsqueeze(1)  # [num_steps, num_envs]
                 loss = -(discounted.sum(dim=0).mean())
 
+                # Optional entropy bonus (matches PPO convention: maximize entropy)
+                if args.apg_ent_coef > 0 and all_entropies:
+                    entropy_loss = torch.stack(all_entropies).mean()
+                    loss = loss - args.apg_ent_coef * entropy_loss
+
                 loss.backward()
 
                 # Global norm clipping
@@ -757,6 +847,8 @@ if __name__ == "__main__":
                 "apg/horizon_return", all_rewards_t.sum().item() / envs.num_envs, global_step
             )
             writer.add_scalar("apg/total_loss", loss.item(), global_step)
+            if args.apg_ent_coef > 0 and all_entropies:
+                writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
             if agent.discrete:
                 writer.add_scalar("apg/gumbel_temperature", temp, global_step)
             writer.add_scalar(
@@ -772,5 +864,39 @@ if __name__ == "__main__":
             writer.add_scalar("by_grad_steps/horizon_return", all_rewards_t.sum().item() / envs.num_envs, total_grad_steps)
             writer.add_scalar("by_wall_time/learning_rate", optimizer.param_groups[0]["lr"], elapsed)
 
+            # Deterministic evaluation
+            if eval_envs is not None and iteration % args.eval_freq == 0:
+                deterministic_eval(agent, obs_normalizer, args, device, eval_envs, writer, global_step, total_grad_steps)
+
+    if eval_envs is not None:
+        eval_envs.close()
     envs.close()
     writer.close()
+
+
+if __name__ == "__main__":
+    args = tyro.cli(Args, args=_normalize_cli_args(sys.argv[1:]))
+    args.batch_size = int(args.num_envs * args.num_steps)
+    args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    if args.algorithm == "apg":
+        apg_batch_size = int(args.num_envs * args.max_episode_steps * args.apg_num_grad_steps)
+
+        args.num_iterations = args.total_timesteps // apg_batch_size
+        if args.equalize_grad_steps:
+            ppo_grads_per_iter = args.update_epochs * args.num_minibatches
+            apg_grads_per_iter = args.apg_num_grad_steps
+            ppo_iters = args.total_timesteps // args.batch_size
+            args.num_iterations = ppo_iters * ppo_grads_per_iter // apg_grads_per_iter
+            print(f"equalize_grad_steps: scaling APG to {args.num_iterations} iterations "
+                  f"(PPO would have {ppo_iters} iters × {ppo_grads_per_iter} grads = "
+                  f"{ppo_iters * ppo_grads_per_iter} total grad steps)")
+        print(f"APG: batch_size={args.num_envs}, num_iterations={args.num_iterations}")
+    else:
+        args.num_iterations = args.total_timesteps // args.batch_size
+        print(f"PPO: minibatch_size={args.minibatch_size}, num_iterations={args.num_iterations}")
+
+    seeds = list(range(1, args.num_seeds + 1)) if args.num_seeds > 1 else [args.seed]
+    for seed_idx, seed in enumerate(seeds):
+        if args.num_seeds > 1:
+            print(f"\n{'='*60}\nSeed {seed} ({seed_idx+1}/{len(seeds)})\n{'='*60}")
+        _run_training(args, seed)
