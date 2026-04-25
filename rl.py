@@ -106,15 +106,8 @@ class Args:
     """whether to anneal Gumbel-Softmax temperature over training"""
     apg_num_grad_steps: int = 8
     """number of gradient steps per iteration"""
-    apg_adam_b1: float = 0.7
-    """Adam beta1 (Brax uses 0.7 for more responsive updates)"""
-    apg_adam_b2: float = 0.95
-    """Adam beta2 (Brax uses 0.95)"""
     apg_per_param_clip: float = 1.0
     """per-parameter gradient clipping before optimizer"""
-
-    apg_lr_decay: float = 0.997
-    """exponential LR decay rate per gradient step"""
 
     # Comparison
     max_episode_steps: int = 30
@@ -411,7 +404,6 @@ if __name__ == "__main__":
         optimizer = optim.Adam(
             agent.actor_parameters(),
             lr=args.learning_rate,
-            betas=(args.apg_adam_b1, args.apg_adam_b2),
             eps=1e-5,
         )
 
@@ -663,12 +655,13 @@ if __name__ == "__main__":
             else:
                 temp = args.apg_gumbel_temp_init
 
+            # Linear LR annealing (matching PPO schedule for fair comparison).
+            if args.anneal_lr:
+                frac = 1.0 - (iteration - 1.0) / args.num_iterations
+                optimizer.param_groups[0]["lr"] = frac * args.learning_rate
+
             for grad_step in range(args.apg_num_grad_steps):
                 total_grad_steps += 1
-
-                # Exponential LR decay per gradient step
-                lr = args.learning_rate * (args.apg_lr_decay ** total_grad_steps)
-                optimizer.param_groups[0]["lr"] = lr
 
                 optimizer.zero_grad()
 
