@@ -123,7 +123,7 @@ class Args:
     # Comparison
     max_episode_steps: int = 30
     """max episode steps for custom environments"""
-    equalize_grad_steps: bool = False
+    equalize_grad_steps: bool = True
     """scale APG iterations so total gradient steps match PPO"""
 
     # Seed sweep & evaluation
@@ -533,7 +533,7 @@ def _run_training(args, seed):
         envs.single_action_space, gym.spaces.Box
     ), "only discrete and box action spaces are supported"
 
-    agent = Agent(envs, use_layernorm=True).to(device)
+    agent = Agent(envs, use_layernorm=False).to(device)
 
     # Eval env setup (separate from training env)
     eval_envs = (

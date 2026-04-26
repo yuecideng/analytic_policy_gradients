@@ -32,7 +32,7 @@ LINEAR_DAMPING = 5.0  # velocity damping coefficient
 
 DT = 1.0 / 60.0
 DEFAULT_MAX_EPISODE_STEPS = 100
-SUCCESS_POS_THRESHOLD = 0.01  # 1 cm
+SUCCESS_POS_THRESHOLD = 0.03  # 3 cm
 
 # Obstacle configuration
 NUM_OBSTACLES = 2
