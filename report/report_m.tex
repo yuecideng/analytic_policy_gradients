@@ -467,8 +467,8 @@ Table~\ref{tab:env_comparison} compares the four environments across key propert
     Observation dim        & 2                         & 14                         & 9                          & 28 \\
     Action dim             & 1                         & 2                          & 3                          & 7 \\
     Dynamics               & 1D hill car              & Point mass (Euler)         & 2D rigid body (Euler)      & Articulated body (Featherstone) \\
-    DOF                    & 1 (track position)        & 2 (pos)                    & 3 (pos + rot)              & 7 (joints) \\
-    Max episode steps      & 200                       & 100                        & 100                        & 30 \\
+    DOF                    & 1 (pos)        & 2 (pos)                    & 3 (pos + rot)              & 7 (joints) \\
+    Max episode steps      & 30                        & 100                        & 100                        & 30 \\
     Gradient bridge        & Native PyTorch            & Native PyTorch             & Native PyTorch             & Warp $\leftrightarrow$ PyTorch \\
     Obstacles/constraints  & Terrain slope + bounds    & 2 circles                  & Workspace bounds           & Joint limits \\
     Orientation            & No                        & No                         & Yes ($\theta$)             & Yes (quaternion) \\
