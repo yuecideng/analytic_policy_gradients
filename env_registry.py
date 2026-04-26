@@ -53,6 +53,16 @@ try:
 except ImportError:
     _pointmass_spec = None
 
+try:
+    from mountaincar_continuous_diff_env import MountainCarContinuousAPGEnv,MountainCarContinuousVecEnv
+
+    _diff_mountaincar_spec = EnvSpec(
+        ppo_factory=lambda **kw: MountainCarContinuousVecEnv(**kw),
+        apg_factory=lambda **kw: MountainCarContinuousAPGEnv(**kw),
+    )
+except ImportError:
+    _diff_mountaincar_spec = None
+
 
 IMPLEMENTED_ENVS: Dict[str, EnvSpec] = {}
 
@@ -67,6 +77,10 @@ if _pusht_spec is not None:
 # Register PointMassNavigate (pure PyTorch, no heavy deps — always available).
 if _pointmass_spec is not None:
     IMPLEMENTED_ENVS["PointMassNavigate-v0"] = _pointmass_spec
+
+# Register DiffMountainCarContinuous 
+if _diff_mountaincar_spec is not None:
+    IMPLEMENTED_ENVS["DiffMountainCarContinuous-v0"] = _diff_mountaincar_spec
 
 
 def _register_gym_envs():
