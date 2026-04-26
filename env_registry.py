@@ -34,6 +34,7 @@ except ImportError:
     _franka_spec = None
 
 try:
+<<<<<<< HEAD
     from push_t_env import PushTAPGEnv, PushTVecEnv
 
     _pusht_spec = EnvSpec(
@@ -52,6 +53,19 @@ try:
     )
 except ImportError:
     _pointmass_spec = None
+=======
+    from mountaincar_continuous_diff_env import (
+        MountainCarContinuousAPGEnv,
+        MountainCarContinuousVecEnv,
+    )
+
+    _diff_mountaincar_spec = EnvSpec(
+        ppo_factory=lambda **kw: MountainCarContinuousVecEnv(**kw),
+        apg_factory=lambda **kw: MountainCarContinuousAPGEnv(**kw),
+    )
+except ImportError:
+    _diff_mountaincar_spec = None
+>>>>>>> b498469 (Add differentiable MountainCar environment)
 
 
 IMPLEMENTED_ENVS: Dict[str, EnvSpec] = {}
@@ -60,6 +74,7 @@ IMPLEMENTED_ENVS: Dict[str, EnvSpec] = {}
 if _franka_spec is not None:
     IMPLEMENTED_ENVS["FrankaReach-v0"] = _franka_spec
 
+<<<<<<< HEAD
 # Register PushT (pure PyTorch, no heavy deps — always available).
 if _pusht_spec is not None:
     IMPLEMENTED_ENVS["PushT-v0"] = _pusht_spec
@@ -67,6 +82,10 @@ if _pusht_spec is not None:
 # Register PointMassNavigate (pure PyTorch, no heavy deps — always available).
 if _pointmass_spec is not None:
     IMPLEMENTED_ENVS["PointMassNavigate-v0"] = _pointmass_spec
+=======
+if _diff_mountaincar_spec is not None:
+    IMPLEMENTED_ENVS["DiffMountainCarContinuous-v0"] = _diff_mountaincar_spec
+>>>>>>> b498469 (Add differentiable MountainCar environment)
 
 
 def _register_gym_envs():
