@@ -105,7 +105,7 @@ class Args:
     """minimum temperature for Gumbel-Softmax"""
     apg_anneal_temp: bool = True
     """whether to anneal Gumbel-Softmax temperature over training"""
-    apg_num_grad_steps: int = 8
+    apg_num_grad_steps: int = 16
     """number of gradient steps per iteration"""
     apg_per_param_clip: float = 1.0
     """per-parameter gradient clipping before optimizer"""
@@ -113,7 +113,7 @@ class Args:
     """coefficient of the entropy bonus for APG (0 = disabled, 0.01 = match PPO default)"""
     apg_segment_length: int = 0
     """segment length for value bootstrapping (0 = max_episode_steps, backward compat)"""
-    apg_bootstrap: str = "mc"
+    apg_bootstrap: str = "critic"
     """bootstrap mode for segmented APG: 'mc' uses collected future rewards, 'critic' uses learned V(s)"""
     apg_critic_coef: float = 0.5
     """coefficient of the critic loss for segmented APG (only used with --apg_bootstrap critic)"""
@@ -185,7 +185,16 @@ def make_env(env_id, idx, capture_video, run_name):
     return thunk
 
 
-def make_custom_vec_env(env_id, num_envs, algorithm, device, headless, max_episode_steps=200, capture_video=False, video_dir="videos"):
+def make_custom_vec_env(
+    env_id,
+    num_envs,
+    algorithm,
+    device,
+    headless,
+    max_episode_steps=200,
+    capture_video=False,
+    video_dir="videos",
+):
     env_spec = get_env_spec(env_id)
     if env_spec is None:
         return None
@@ -195,7 +204,12 @@ def make_custom_vec_env(env_id, num_envs, algorithm, device, headless, max_episo
         mode = "PPO" if algorithm == "ppo" else "APG"
         raise ValueError(f"Environment '{env_id}' does not implement {mode} mode.")
 
-    kw = dict(num_envs=num_envs, device=str(device), headless=headless, max_episode_steps=max_episode_steps)
+    kw = dict(
+        num_envs=num_envs,
+        device=str(device),
+        headless=headless,
+        max_episode_steps=max_episode_steps,
+    )
 
     # Pass capture_video / video_dir; if the env constructor doesn't accept
     # them (e.g. FrankaReachVecEnv), fall back without them.
@@ -222,23 +236,37 @@ def _create_eval_envs(args, device, run_name=""):
         return eval_envs
     # Fallback for standard gymnasium envs
     from torch_wrapper_env import TorchWrapperEnv
+
     gym_envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, False, "") for i in range(args.num_envs)],
     )
     return TorchWrapperEnv(gym_envs)
 
 
-def deterministic_eval(agent, obs_normalizer, args, device, eval_envs, writer, global_step, total_grad_steps):
+def deterministic_eval(
+    agent,
+    obs_normalizer,
+    args,
+    device,
+    eval_envs,
+    writer,
+    global_step,
+    total_grad_steps,
+):
     """Run deterministic evaluation episodes and log results."""
     completed_returns = []
     completed_lengths = []
+    completed_successes = []
+    completed_final_dists = []
 
     obs, _ = eval_envs.reset()
     obs = obs.to(device)
     ep_ret = torch.zeros(eval_envs.num_envs, dtype=torch.float32, device=device)
     ep_len = torch.zeros(eval_envs.num_envs, dtype=torch.int64, device=device)
 
-    max_steps = args.max_episode_steps * max(3, args.eval_episodes // eval_envs.num_envs + 1)
+    max_steps = args.max_episode_steps * max(
+        3, args.eval_episodes // eval_envs.num_envs + 1
+    )
 
     for _ in range(max_steps):
         with torch.no_grad():
@@ -248,7 +276,7 @@ def deterministic_eval(agent, obs_normalizer, args, device, eval_envs, writer, g
             else:
                 action = agent.actor_mean(norm_obs).clamp(-1.0, 1.0)
 
-        obs, reward, terminated, truncated, _ = eval_envs.step(action)
+        obs, reward, terminated, truncated, infos = eval_envs.step(action)
         obs = obs.to(device)
         reward = reward.to(device)
         terminated = terminated.to(device)
@@ -263,27 +291,57 @@ def deterministic_eval(agent, obs_normalizer, args, device, eval_envs, writer, g
             for i in indices:
                 completed_returns.append(ep_ret[i].item())
                 completed_lengths.append(ep_len[i].item())
+                completed_successes.append(terminated[i].item())
+                if "final_distance" in infos:
+                    completed_final_dists.append(
+                        infos["final_distance"][i].item()
+                        if isinstance(infos["final_distance"], torch.Tensor)
+                        else infos["final_distance"][i]
+                    )
             ep_ret[done_mask] = 0.0
             ep_len[done_mask] = 0
 
         if len(completed_returns) >= args.eval_episodes:
             break
 
+    result = {"mean_ret": None, "success_rate": None}
     if completed_returns:
         n = min(len(completed_returns), args.eval_episodes)
         mean_ret = np.mean(completed_returns[:n])
         mean_len = np.mean(completed_lengths[:n])
+        success_rate = np.mean(completed_successes[:n])
         writer.add_scalar("eval/episodic_return", mean_ret, global_step)
         writer.add_scalar("eval/episodic_length", mean_len, global_step)
         writer.add_scalar("by_grad_steps/eval_return", mean_ret, total_grad_steps)
-        print(f"  eval (step={global_step}): return={mean_ret:.5f}, length={mean_len:.1f} "
-              f"({n} episodes)")
+        writer.add_scalar("eval/success_rate", success_rate, global_step)
+        writer.add_scalar(
+            "by_grad_steps/eval_success_rate", success_rate, total_grad_steps
+        )
+        # Mean time to success (episode length conditioned on success)
+        success_lengths = [
+            completed_lengths[i] for i in range(n) if completed_successes[i]
+        ]
+        if success_lengths:
+            writer.add_scalar(
+                "eval/mean_time_to_success", np.mean(success_lengths), global_step
+            )
+        # Mean final distance
+        if completed_final_dists:
+            writer.add_scalar(
+                "eval/mean_final_distance",
+                np.mean(completed_final_dists[:n]),
+                global_step,
+            )
+        print(
+            f"  eval (step={global_step}): return={mean_ret:.5f}, length={mean_len:.1f}, "
+            f"success_rate={success_rate:.3f} ({n} episodes)"
+        )
+        result["mean_ret"] = mean_ret
+        result["success_rate"] = success_rate
     # Flush any remaining recorded frames as a video
     if hasattr(eval_envs, "video_recorder") and eval_envs.video_recorder is not None:
         eval_envs.video_recorder.on_episode_end(global_step)
-    if completed_returns:
-        return mean_ret
-    return None
+    return result
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -478,7 +536,9 @@ def _run_training(args, seed):
     agent = Agent(envs, use_layernorm=True).to(device)
 
     # Eval env setup (separate from training env)
-    eval_envs = _create_eval_envs(args, device, run_name) if args.eval_freq > 0 else None
+    eval_envs = (
+        _create_eval_envs(args, device, run_name) if args.eval_freq > 0 else None
+    )
 
     # optimizer setup
     if args.algorithm == "ppo":
@@ -489,15 +549,28 @@ def _run_training(args, seed):
         )
     else:
         # Determine if segmented APG with critic bootstrap is active
-        effective_seg = args.apg_segment_length if args.apg_segment_length > 0 else args.max_episode_steps
-        use_critic = effective_seg < args.max_episode_steps and args.apg_bootstrap == "critic"
+        effective_seg = (
+            args.apg_segment_length
+            if args.apg_segment_length > 0
+            else args.max_episode_steps
+        )
+        use_critic = (
+            effective_seg < args.max_episode_steps and args.apg_bootstrap == "critic"
+        )
 
         if use_critic:
-            critic_lr = args.apg_critic_lr if args.apg_critic_lr is not None else args.learning_rate
-            optimizer = optim.Adam([
-                {"params": agent.actor_parameters(), "lr": args.learning_rate},
-                {"params": list(agent.critic.parameters()), "lr": critic_lr},
-            ], eps=1e-5)
+            critic_lr = (
+                args.apg_critic_lr
+                if args.apg_critic_lr is not None
+                else args.learning_rate
+            )
+            optimizer = optim.Adam(
+                [
+                    {"params": agent.actor_parameters(), "lr": args.learning_rate},
+                    {"params": list(agent.critic.parameters()), "lr": critic_lr},
+                ],
+                eps=1e-5,
+            )
         else:
             optimizer = optim.Adam(
                 agent.actor_parameters(),
@@ -509,6 +582,7 @@ def _run_training(args, seed):
     global_step = 0
     start_time = time.time()
     should_print_episodes = args.print_every_n_episodes > 0
+    eval_success_rates = []
 
     if args.algorithm == "ppo":
         # ========== PPO Training Loop ==========
@@ -579,11 +653,33 @@ def _run_training(args, seed):
                     avg_len = current_ep_len[done_mask].mean().item()
                     writer.add_scalar("charts/episodic_return", avg_ret, global_step)
                     writer.add_scalar("charts/episodic_length", avg_len, global_step)
+                    writer.add_scalar(
+                        "charts/success_rate",
+                        terminated[done_mask].bool().float().mean().item(),
+                        global_step,
+                    )
+                    # Mean time to success
+                    success_mask = terminated[done_mask].bool()
+                    if success_mask.any():
+                        writer.add_scalar(
+                            "charts/mean_time_to_success",
+                            current_ep_len[done_mask][success_mask].mean().item(),
+                            global_step,
+                        )
+                    # Mean final distance
+                    if "final_distance" in infos:
+                        writer.add_scalar(
+                            "charts/mean_final_distance",
+                            infos["final_distance"][done_mask].mean().item(),
+                            global_step,
+                        )
                     if (
                         should_print_episodes
                         and episode_count % args.print_every_n_episodes == 0
                     ):
-                        print(f"global_step={global_step}, episodic_return={avg_ret:.5f}, episodic_length={avg_len}")
+                        print(
+                            f"global_step={global_step}, episodic_return={avg_ret:.5f}, episodic_length={avg_len}"
+                        )
 
                 # Reset tracking for done environments
                 current_ep_ret[done_mask] = 0.0
@@ -710,22 +806,41 @@ def _run_training(args, seed):
             writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
             writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
             writer.add_scalar("losses/explained_variance", explained_var, global_step)
-            writer.add_scalar(
-                "charts/SPS", int(global_step / elapsed), global_step
-            )
+            writer.add_scalar("charts/SPS", int(global_step / elapsed), global_step)
             # Multi-axis logging for fair PPO vs APG comparison
             writer.add_scalar("charts/total_grad_steps", total_grad_steps, global_step)
             writer.add_scalar("charts/wall_time", elapsed, global_step)
             writer.add_scalar("perf/iter_time_sec", iter_elapsed, global_step)
-            writer.add_scalar("perf/grad_steps_per_sec", total_grad_steps / elapsed, global_step)
+            writer.add_scalar(
+                "perf/grad_steps_per_sec", total_grad_steps / elapsed, global_step
+            )
             # Log key metrics keyed by grad_steps and wall_time too
-            writer.add_scalar("by_grad_steps/learning_rate", optimizer.param_groups[0]["lr"], total_grad_steps)
+            writer.add_scalar(
+                "by_grad_steps/learning_rate",
+                optimizer.param_groups[0]["lr"],
+                total_grad_steps,
+            )
             writer.add_scalar("by_grad_steps/total_loss", loss.item(), total_grad_steps)
-            writer.add_scalar("by_wall_time/learning_rate", optimizer.param_groups[0]["lr"], elapsed)
+            writer.add_scalar(
+                "by_wall_time/learning_rate", optimizer.param_groups[0]["lr"], elapsed
+            )
 
             # Deterministic evaluation
             if eval_envs is not None and iteration % args.eval_freq == 0:
-                deterministic_eval(agent, obs_normalizer, args, device, eval_envs, writer, global_step, total_grad_steps)
+                eval_result = deterministic_eval(
+                    agent,
+                    obs_normalizer,
+                    args,
+                    device,
+                    eval_envs,
+                    writer,
+                    global_step,
+                    total_grad_steps,
+                )
+                if eval_result["success_rate"] is not None:
+                    eval_success_rates.append(
+                        (total_grad_steps, eval_result["success_rate"])
+                    )
 
     elif args.algorithm == "apg":
         # ========== APG Training Loop ==========
@@ -770,7 +885,11 @@ def _run_training(args, seed):
 
                 optimizer.zero_grad()
 
-                effective_seg = args.apg_segment_length if args.apg_segment_length > 0 else args.max_episode_steps
+                effective_seg = (
+                    args.apg_segment_length
+                    if args.apg_segment_length > 0
+                    else args.max_episode_steps
+                )
                 num_segments = math.ceil(args.max_episode_steps / effective_seg)
                 use_seg = effective_seg < args.max_episode_steps
 
@@ -779,10 +898,14 @@ def _run_training(args, seed):
                 all_entropies = []
 
                 # Per-segment storage
-                seg_rewards_all = []       # list of lists of [num_envs] reward tensors
-                seg_norm_obs_end = []      # normalized obs at end of each segment (for critic)
-                seg_norm_obs_start = []    # normalized obs at start of each segment (for critic)
-                seg_steps_list = []        # actual steps per segment
+                seg_rewards_all = []  # list of lists of [num_envs] reward tensors
+                seg_norm_obs_end = (
+                    []
+                )  # normalized obs at end of each segment (for critic)
+                seg_norm_obs_start = (
+                    []
+                )  # normalized obs at start of each segment (for critic)
+                seg_steps_list = []  # actual steps per segment
 
                 # ===== Segmented forward pass =====
                 for seg_idx in range(num_segments):
@@ -828,13 +951,41 @@ def _run_training(args, seed):
                             episode_count += num_done
                             avg_ret = current_ep_ret[done_mask].mean().item()
                             avg_len = current_ep_len[done_mask].mean().item()
-                            writer.add_scalar("charts/episodic_return", avg_ret, global_step)
-                            writer.add_scalar("charts/episodic_length", avg_len, global_step)
+                            writer.add_scalar(
+                                "charts/episodic_return", avg_ret, global_step
+                            )
+                            writer.add_scalar(
+                                "charts/episodic_length", avg_len, global_step
+                            )
+                            writer.add_scalar(
+                                "charts/success_rate",
+                                terminated[done_mask].bool().float().mean().item(),
+                                global_step,
+                            )
+                            # Mean time to success
+                            success_mask = terminated[done_mask].bool()
+                            if success_mask.any():
+                                writer.add_scalar(
+                                    "charts/mean_time_to_success",
+                                    current_ep_len[done_mask][success_mask]
+                                    .mean()
+                                    .item(),
+                                    global_step,
+                                )
+                            # Mean final distance
+                            if "final_distance" in infos:
+                                writer.add_scalar(
+                                    "charts/mean_final_distance",
+                                    infos["final_distance"][done_mask].mean().item(),
+                                    global_step,
+                                )
                             if (
                                 should_print_episodes
                                 and episode_count % args.print_every_n_episodes == 0
                             ):
-                                print(f"global_step={global_step}, episodic_return={avg_ret:.5f}, episodic_length={avg_len}")
+                                print(
+                                    f"global_step={global_step}, episodic_return={avg_ret:.5f}, episodic_length={avg_len}"
+                                )
 
                         current_ep_ret[done_mask] = 0.0
                         current_ep_len[done_mask] = 0.0
@@ -848,8 +999,11 @@ def _run_training(args, seed):
                         envs.detach_state()
                     else:
                         for attr in (
-                            "block_pos", "block_angle", "block_vel",
-                            "block_ang_vel", "last_action",
+                            "block_pos",
+                            "block_angle",
+                            "block_vel",
+                            "block_ang_vel",
+                            "last_action",
                         ):
                             t = getattr(envs, attr, None)
                             if isinstance(t, torch.Tensor):
@@ -869,15 +1023,19 @@ def _run_training(args, seed):
                     for seg_idx in reversed(range(num_segments)):
                         mc_future[seg_idx] = running_future.clone()
                         seg_steps = seg_steps_list[seg_idx]
-                        running_future = running_future * (args.gamma ** seg_steps)
+                        running_future = running_future * (args.gamma**seg_steps)
                         for t, r in enumerate(seg_rewards_all[seg_idx]):
-                            running_future = running_future + r.detach() * (args.gamma ** t)
+                            running_future = running_future + r.detach() * (
+                                args.gamma**t
+                            )
 
                 # Build per-segment losses
                 for seg_idx in range(num_segments):
                     seg_steps = seg_steps_list[seg_idx]
                     seg_rewards_t = torch.stack(seg_rewards_all[seg_idx])
-                    discounts = args.gamma ** torch.arange(seg_steps, device=device, dtype=torch.float32)
+                    discounts = args.gamma ** torch.arange(
+                        seg_steps, device=device, dtype=torch.float32
+                    )
                     seg_return = (seg_rewards_t * discounts.unsqueeze(1)).sum(dim=0)
 
                     is_last = seg_idx == num_segments - 1
@@ -885,9 +1043,11 @@ def _run_training(args, seed):
                         if args.apg_bootstrap == "mc":
                             bootstrap_value = mc_future[seg_idx]
                         elif args.apg_bootstrap == "critic":
-                            bootstrap_value = (args.gamma ** seg_steps) * agent.get_value(
-                                seg_norm_obs_end[seg_idx]
-                            ).squeeze(-1).detach()
+                            bootstrap_value = (
+                                args.gamma**seg_steps
+                            ) * agent.get_value(seg_norm_obs_end[seg_idx]).squeeze(
+                                -1
+                            ).detach()
                         else:
                             bootstrap_value = torch.zeros(args.num_envs, device=device)
                     else:
@@ -898,12 +1058,20 @@ def _run_training(args, seed):
                     # Collect critic training data
                     if use_seg and args.apg_bootstrap == "critic":
                         with torch.no_grad():
-                            critic_pred = agent.get_value(seg_norm_obs_start[seg_idx]).squeeze(-1)
+                            critic_pred = agent.get_value(
+                                seg_norm_obs_start[seg_idx]
+                            ).squeeze(-1)
                         critic_values_list.append(critic_pred)
-                        critic_targets_list.append((seg_return + bootstrap_value).detach())
+                        critic_targets_list.append(
+                            (seg_return + bootstrap_value).detach()
+                        )
 
                 # ===== Critic loss =====
-                if use_seg and args.apg_bootstrap == "critic" and len(critic_values_list) > 0:
+                if (
+                    use_seg
+                    and args.apg_bootstrap == "critic"
+                    and len(critic_values_list) > 0
+                ):
                     critic_values_t = torch.cat(critic_values_list)
                     critic_targets_t = torch.cat(critic_targets_list)
                     critic_loss = F.mse_loss(critic_values_t, critic_targets_t)
@@ -919,11 +1087,11 @@ def _run_training(args, seed):
 
                 loss.backward()
 
-                nn.utils.clip_grad_norm_(
-                    agent.actor_parameters(), args.max_grad_norm
-                )
+                nn.utils.clip_grad_norm_(agent.actor_parameters(), args.max_grad_norm)
                 if use_seg and args.apg_bootstrap == "critic":
-                    nn.utils.clip_grad_norm_(agent.critic.parameters(), args.max_grad_norm)
+                    nn.utils.clip_grad_norm_(
+                        agent.critic.parameters(), args.max_grad_norm
+                    )
                 optimizer.step()
 
             # Logging (once per iteration, after all grad steps)
@@ -932,17 +1100,13 @@ def _run_training(args, seed):
             iter_elapsed = time.time() - iter_start_time
 
             # Compute total reward across all segments for logging
-            total_reward = sum(
-                r.sum().item() for seg in seg_rewards_all for r in seg
-            )
+            total_reward = sum(r.sum().item() for seg in seg_rewards_all for r in seg)
             horizon_return = total_reward / envs.num_envs
 
             writer.add_scalar(
                 "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
             )
-            writer.add_scalar(
-                "apg/horizon_return", horizon_return, global_step
-            )
+            writer.add_scalar("apg/horizon_return", horizon_return, global_step)
             writer.add_scalar("apg/total_loss", loss.item(), global_step)
             if args.apg_ent_coef > 0 and all_entropies:
                 writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
@@ -950,35 +1114,79 @@ def _run_training(args, seed):
                 writer.add_scalar("apg/gumbel_temperature", temp, global_step)
 
             # Segmented APG metrics
-            effective_seg_log = args.apg_segment_length if args.apg_segment_length > 0 else args.max_episode_steps
+            effective_seg_log = (
+                args.apg_segment_length
+                if args.apg_segment_length > 0
+                else args.max_episode_steps
+            )
             use_seg_log = effective_seg_log < args.max_episode_steps
             if use_seg_log:
                 writer.add_scalar("apg/num_segments", num_segments, global_step)
-                writer.add_scalar("apg/bootstrap_mode", 0.0 if args.apg_bootstrap == "mc" else 1.0, global_step)
+                writer.add_scalar(
+                    "apg/bootstrap_mode",
+                    0.0 if args.apg_bootstrap == "mc" else 1.0,
+                    global_step,
+                )
                 if args.apg_bootstrap == "critic":
-                    writer.add_scalar("apg/critic_loss", critic_loss.item(), global_step)
+                    writer.add_scalar(
+                        "apg/critic_loss", critic_loss.item(), global_step
+                    )
                     if critic_values_list:
                         critic_val_mean = torch.cat(critic_values_list).mean().item()
                         critic_tgt_mean = torch.cat(critic_targets_list).mean().item()
-                        writer.add_scalar("apg/critic_value_mean", critic_val_mean, global_step)
-                        writer.add_scalar("apg/critic_target_mean", critic_tgt_mean, global_step)
+                        writer.add_scalar(
+                            "apg/critic_value_mean", critic_val_mean, global_step
+                        )
+                        writer.add_scalar(
+                            "apg/critic_target_mean", critic_tgt_mean, global_step
+                        )
 
-            writer.add_scalar(
-                "charts/SPS", int(global_step / elapsed), global_step
-            )
+            writer.add_scalar("charts/SPS", int(global_step / elapsed), global_step)
             writer.add_scalar("charts/total_grad_steps", total_grad_steps, global_step)
             writer.add_scalar("charts/wall_time", elapsed, global_step)
             writer.add_scalar("perf/iter_time_sec", iter_elapsed, global_step)
-            writer.add_scalar("perf/grad_steps_per_sec", total_grad_steps / elapsed, global_step)
+            writer.add_scalar(
+                "perf/grad_steps_per_sec", total_grad_steps / elapsed, global_step
+            )
             # Log key metrics keyed by grad_steps and wall_time too
-            writer.add_scalar("by_grad_steps/learning_rate", optimizer.param_groups[0]["lr"], total_grad_steps)
+            writer.add_scalar(
+                "by_grad_steps/learning_rate",
+                optimizer.param_groups[0]["lr"],
+                total_grad_steps,
+            )
             writer.add_scalar("by_grad_steps/total_loss", loss.item(), total_grad_steps)
-            writer.add_scalar("by_grad_steps/horizon_return", horizon_return, total_grad_steps)
-            writer.add_scalar("by_wall_time/learning_rate", optimizer.param_groups[0]["lr"], elapsed)
+            writer.add_scalar(
+                "by_grad_steps/horizon_return", horizon_return, total_grad_steps
+            )
+            writer.add_scalar(
+                "by_wall_time/learning_rate", optimizer.param_groups[0]["lr"], elapsed
+            )
 
             # Deterministic evaluation
             if eval_envs is not None and iteration % args.eval_freq == 0:
-                deterministic_eval(agent, obs_normalizer, args, device, eval_envs, writer, global_step, total_grad_steps)
+                eval_result = deterministic_eval(
+                    agent,
+                    obs_normalizer,
+                    args,
+                    device,
+                    eval_envs,
+                    writer,
+                    global_step,
+                    total_grad_steps,
+                )
+                if eval_result["success_rate"] is not None:
+                    eval_success_rates.append(
+                        (total_grad_steps, eval_result["success_rate"])
+                    )
+
+    # Compute AUC of success rate curve
+    if eval_success_rates:
+        gs = np.array([x[0] for x in eval_success_rates])
+        sr = np.array([x[1] for x in eval_success_rates])
+        if gs[-1] > 0:
+            auc = np.trapezoid(sr, gs / gs[-1])
+            writer.add_scalar("summary/auc_success_rate", auc, 0)
+            print(f"  AUC (success rate): {auc:.6f}")
 
     if eval_envs is not None:
         eval_envs.close()
@@ -991,7 +1199,9 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     if args.algorithm == "apg":
-        apg_batch_size = int(args.num_envs * args.max_episode_steps * args.apg_num_grad_steps)
+        apg_batch_size = int(
+            args.num_envs * args.max_episode_steps * args.apg_num_grad_steps
+        )
 
         args.num_iterations = args.total_timesteps // apg_batch_size
         if args.equalize_grad_steps:
@@ -999,13 +1209,17 @@ if __name__ == "__main__":
             apg_grads_per_iter = args.apg_num_grad_steps
             ppo_iters = args.total_timesteps // args.batch_size
             args.num_iterations = ppo_iters * ppo_grads_per_iter // apg_grads_per_iter
-            print(f"equalize_grad_steps: scaling APG to {args.num_iterations} iterations "
-                  f"(PPO would have {ppo_iters} iters × {ppo_grads_per_iter} grads = "
-                  f"{ppo_iters * ppo_grads_per_iter} total grad steps)")
+            print(
+                f"equalize_grad_steps: scaling APG to {args.num_iterations} iterations "
+                f"(PPO would have {ppo_iters} iters × {ppo_grads_per_iter} grads = "
+                f"{ppo_iters * ppo_grads_per_iter} total grad steps)"
+            )
         print(f"APG: batch_size={args.num_envs}, num_iterations={args.num_iterations}")
     else:
         args.num_iterations = args.total_timesteps // args.batch_size
-        print(f"PPO: minibatch_size={args.minibatch_size}, num_iterations={args.num_iterations}")
+        print(
+            f"PPO: minibatch_size={args.minibatch_size}, num_iterations={args.num_iterations}"
+        )
 
     seeds = list(range(1, args.num_seeds + 1)) if args.num_seeds > 1 else [args.seed]
     for seed_idx, seed in enumerate(seeds):

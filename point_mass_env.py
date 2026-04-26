@@ -63,26 +63,23 @@ def _compute_reward(
 
     Terms:
       - position_tracking:             -1.0  * ||pos - goal||
-      - position_tracking_fine_grained: +0.5 * (1 - tanh(dist / 0.05))
+      - position_tracking_fine_grained: +0.5 * exp(-dist^2 / (2*0.05^2))
       - obstacle_penalty:              -2.0  * sum(max(0, r - d)^2) per obstacle
       - action_rate:                   -0.001 * ||action - prev_action||^2
       - speed_penalty:                 -0.01 * ||vel||^2
     """
     pos_dist = (pos - goal_pos).norm(dim=-1)
-    reward = (
-        -1.0 * pos_dist
-        + 0.5 * (1.0 - torch.tanh(pos_dist / 0.05))
-    )
+    reward = -1.0 * pos_dist + 0.5 * torch.exp(-(pos_dist**2) / (2 * 0.05**2))
 
     # Obstacle penalty: smooth repulsion when inside obstacle radius
     for i in range(NUM_OBSTACLES):
         diff = pos - obstacle_pos[:, i * 2 : i * 2 + 2]
         dist_to_center = diff.norm(dim=-1)
         penetration = torch.clamp(obstacle_radii[:, i] - dist_to_center, min=0.0)
-        reward = reward - 2.0 * penetration ** 2
+        reward = reward - 2.0 * penetration**2
 
     # Speed penalty
-    reward = reward - 0.01 * (vel ** 2).sum(dim=-1)
+    reward = reward - 0.01 * (vel**2).sum(dim=-1)
 
     if action is not None and last_action is not None:
         action_rate = ((action - last_action) ** 2).sum(dim=-1)
@@ -116,11 +113,9 @@ def _sample_obstacles(num_envs: int, goal_pos: torch.Tensor, device: str = "cpu"
     obstacle_radii = torch.zeros(num_envs, NUM_OBSTACLES, device=device)
 
     for i in range(NUM_OBSTACLES):
-        obstacle_radii[:, i] = (
-            OBSTACLE_RADIUS_RANGE[0]
-            + torch.rand(num_envs, device=device)
-            * (OBSTACLE_RADIUS_RANGE[1] - OBSTACLE_RADIUS_RANGE[0])
-        )
+        obstacle_radii[:, i] = OBSTACLE_RADIUS_RANGE[0] + torch.rand(
+            num_envs, device=device
+        ) * (OBSTACLE_RADIUS_RANGE[1] - OBSTACLE_RADIUS_RANGE[0])
         # Rejection-sample positions far enough from goal
         for env_idx in range(num_envs):
             for _ in range(50):  # max attempts
@@ -199,8 +194,12 @@ def _render_frame(
 
     # Goal (green star)
     ax.plot(
-        goal_pos[0], goal_pos[1], marker="*", color="green",
-        markersize=15, zorder=5,
+        goal_pos[0],
+        goal_pos[1],
+        marker="*",
+        color="green",
+        markersize=15,
+        zorder=5,
     )
 
     # Point mass (blue circle)
@@ -220,10 +219,14 @@ def _render_frame(
         fx, fy = action[:2] * FORCE_SCALE
         arrow_scale = 0.04
         ax.arrow(
-            pos[0], pos[1],
-            fx * arrow_scale, fy * arrow_scale,
-            head_width=0.03, head_length=0.02,
-            fc="red", ec="red",
+            pos[0],
+            pos[1],
+            fx * arrow_scale,
+            fy * arrow_scale,
+            head_width=0.03,
+            head_length=0.02,
+            fc="red",
+            ec="red",
         )
 
     fig.tight_layout(pad=0)
@@ -306,11 +309,17 @@ class PointMassVecEnv:
         if seed is not None:
             set_seed(seed)
 
-        ids = env_ids if env_ids is not None else torch.arange(self._num_envs, device=self.device)
+        ids = (
+            env_ids
+            if env_ids is not None
+            else torch.arange(self._num_envs, device=self.device)
+        )
         n = len(ids)
 
         goal_pos = _sample_goal(n, device=self.device)
-        obstacle_pos, obstacle_radii = _sample_obstacles(n, goal_pos, device=self.device)
+        obstacle_pos, obstacle_radii = _sample_obstacles(
+            n, goal_pos, device=self.device
+        )
         starts = _sample_start(n, goal_pos, device=self.device)
 
         with torch.no_grad():
@@ -353,7 +362,10 @@ class PointMassVecEnv:
             if done_mask[0]:
                 self.video_recorder.on_episode_end()
 
-        infos = {}
+        infos = {
+            "final_distance": (self.pos - self.goal_pos).norm(dim=-1).detach(),
+            "success": terminated.detach(),
+        }
         if done_mask.any():
             reset_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
             obs, _ = self.reset(reset_ids)
@@ -516,7 +528,10 @@ class PointMassAPGEnv(PointMassVecEnv):
         truncated = self.step_count >= self.max_episode_steps
         done_mask = terminated | truncated
 
-        infos = {}
+        infos = {
+            "final_distance": (self.pos - self.goal_pos).norm(dim=-1).detach(),
+            "success": terminated.detach(),
+        }
         if done_mask.any():
             reset_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
             obs, _ = self.reset(reset_ids)
@@ -543,7 +558,11 @@ def save_video(frames: list[np.ndarray], path: str, fps: int = 60) -> None:
         return [im]
 
     ani = animation.FuncAnimation(
-        fig, _update, frames=len(frames), interval=1000 / fps, blit=True,
+        fig,
+        _update,
+        frames=len(frames),
+        interval=1000 / fps,
+        blit=True,
     )
     ext = path.rsplit(".", 1)[-1].lower()
     if ext == "gif":

@@ -132,7 +132,9 @@ class TestForwardCorrectness(unittest.TestCase):
     def test_apg_joint_q_in_obs_equals_clamped_new_joint_q(self):
         """Arm joint_q in APGEnv obs must equal clamp(init_q + action*scale, lo, hi)."""
         self.apg.reset(seed=10)
-        init_jq = wp.to_torch(self.apg.state_0.joint_q).detach().clone().view(self.N, -1)
+        init_jq = (
+            wp.to_torch(self.apg.state_0.joint_q).detach().clone().view(self.N, -1)
+        )
 
         # Use actions well inside [-1, 1] to avoid the action-clamp distraction.
         action = torch.rand(self.N, FRANKA_NUM_ARM_JOINTS) * 0.4 - 0.2
@@ -153,7 +155,9 @@ class TestForwardCorrectness(unittest.TestCase):
     def test_apg_eef_in_obs_matches_fk_of_new_joint_q(self):
         """EEF position component of APGEnv obs must equal FK(clamp(init_q + action*scale))."""
         self.apg.reset(seed=11)
-        init_jq = wp.to_torch(self.apg.state_0.joint_q).detach().clone().view(self.N, -1)
+        init_jq = (
+            wp.to_torch(self.apg.state_0.joint_q).detach().clone().view(self.N, -1)
+        )
 
         action = torch.rand(self.N, FRANKA_NUM_ARM_JOINTS) * 0.4 - 0.2
         obs, _, _, _, _ = self.apg.step(action)
@@ -293,9 +297,11 @@ class TestForwardCorrectness(unittest.TestCase):
         """
         self.apg.reset(seed=30)
         # Pre-step EEF from global flat body_q (env 0's EE body).
-        eef_pre = wp.to_torch(self.apg.state_0.body_q).detach().clone()[
-            self.apg._ee_global[0], :3
-        ]
+        eef_pre = (
+            wp.to_torch(self.apg.state_0.body_q)
+            .detach()
+            .clone()[self.apg._ee_global[0], :3]
+        )
 
         action = torch.ones(self.N, FRANKA_NUM_ARM_JOINTS) * 0.5
         obs, _, _, _, _ = self.apg.step(action)
@@ -323,9 +329,7 @@ class TestForwardCorrectness(unittest.TestCase):
         # Force env-0 joint-0 just below its upper limit using wp.copy to avoid
         # in-place ops on a requires_grad leaf tensor.
         upper = self.apg.arm_joint_limit_upper[0].item()
-        init_jq_np = (
-            wp.to_torch(self.apg.state_0.joint_q).detach().cpu().numpy().copy()
-        )
+        init_jq_np = wp.to_torch(self.apg.state_0.joint_q).detach().cpu().numpy().copy()
         init_jq_np = init_jq_np.reshape(self.N, -1)
         init_jq_np[0, 0] = upper - 0.01
         tmp_wp = wp.array(

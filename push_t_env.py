@@ -86,7 +86,7 @@ def _compute_reward(
 
     Terms:
       - position_tracking:             −1.0  * ||pos − goal||
-      - position_tracking_fine_grained: +0.5 * (1 − tanh(dist / 0.02))
+      - position_tracking_fine_grained: +0.5 * exp(-dist^2 / (2*0.02^2))
       - orientation_tracking:          −0.5  * |wrap(θ − goal_θ)|
       - action_rate:                   −0.001 * ||action − prev_action||²
     """
@@ -94,7 +94,7 @@ def _compute_reward(
     angle_diff = _wrap_to_pi(block_angle - goal_angle).squeeze(-1).abs()
     reward = (
         -1.0 * pos_dist
-        + 0.5 * (1.0 - torch.tanh(pos_dist / 0.02))
+        + 0.5 * torch.exp(-(pos_dist**2) / (2 * 0.02**2))
         - 0.5 * angle_diff
     )
     if action is not None and last_action is not None:
@@ -200,16 +200,24 @@ def _render_frame(
 
     # Goal T (light green, semi-transparent)
     gt, gs = _make_t_patches(
-        goal_pos[0], goal_pos[1], goal_angle,
-        color="lightgreen", ax=ax, alpha=0.4,
+        goal_pos[0],
+        goal_pos[1],
+        goal_angle,
+        color="lightgreen",
+        ax=ax,
+        alpha=0.4,
     )
     ax.add_patch(gt)
     ax.add_patch(gs)
 
     # Current T (slate gray)
     ct, cs = _make_t_patches(
-        block_pos[0], block_pos[1], block_angle,
-        color="slategray", ax=ax, alpha=0.9,
+        block_pos[0],
+        block_pos[1],
+        block_angle,
+        color="slategray",
+        ax=ax,
+        alpha=0.9,
     )
     ax.add_patch(ct)
     ax.add_patch(cs)
@@ -308,7 +316,11 @@ class PushTVecEnv:
         if seed is not None:
             set_seed(seed)
 
-        ids = env_ids if env_ids is not None else torch.arange(self._num_envs, device=self.device)
+        ids = (
+            env_ids
+            if env_ids is not None
+            else torch.arange(self._num_envs, device=self.device)
+        )
         n = len(ids)
 
         pos, angle = _sample_block_start(n, device=self.device)
@@ -355,7 +367,10 @@ class PushTVecEnv:
             if done_mask[0]:
                 self.video_recorder.on_episode_end()
 
-        infos = {}
+        infos = {
+            "final_distance": (self.block_pos - self.goal_pos).norm(dim=-1).detach(),
+            "success": terminated.detach(),
+        }
         if done_mask.any():
             reset_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
             obs, _ = self.reset(reset_ids)
@@ -530,7 +545,10 @@ class PushTAPGEnv(PushTVecEnv):
         truncated = self.step_count >= self.max_episode_steps
         done_mask = terminated | truncated
 
-        infos = {}
+        infos = {
+            "final_distance": (self.block_pos - self.goal_pos).norm(dim=-1).detach(),
+            "success": terminated.detach(),
+        }
         if done_mask.any():
             reset_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
             obs, _ = self.reset(reset_ids)
@@ -560,7 +578,11 @@ def save_video(frames: list[np.ndarray], path: str, fps: int = 60) -> None:
         return [im]
 
     ani = animation.FuncAnimation(
-        fig, _update, frames=len(frames), interval=1000 / fps, blit=True,
+        fig,
+        _update,
+        frames=len(frames),
+        interval=1000 / fps,
+        blit=True,
     )
     ext = path.rsplit(".", 1)[-1].lower()
     if ext == "gif":

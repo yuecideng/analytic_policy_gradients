@@ -210,3 +210,12 @@ __marimo__/
 runs/
 wandb/
 *.gif
+
+# latex build files
+*.aux
+*.lof
+*.log
+*.pdf
+*.toc
+*.synctex.gz
+*.out 

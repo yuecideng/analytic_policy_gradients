@@ -1,0 +1,796 @@
+\documentclass[11pt,a4paper]{article}
+
+% ---- Packages ----
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{textcomp}
+\usepackage{listings}
+
+\geometry{margin=1in}
+
+% ---- Custom commands ----
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\cA}{\mathcal{A}}
+\newcommand{\cS}{\mathcal{S}}
+\newcommand{\cL}{\mathcal{L}}
+\newcommand{\btheta}{\bm{\theta}}
+\newcommand{\bepsilon}{\bm{\epsilon}}
+\newcommand{\bmu}{\bm{\mu}}
+\newcommand{\bsigma}{\bm{\sigma}}
+\newcommand{\bvf}{\mathbf{v}}
+\newcommand{\bpf}{\mathbf{p}}
+\newcommand{\bff}{\mathbf{f}}
+\newcommand{\ba}{\mathbf{a}}
+\newcommand{\bg}{\mathbf{g}}
+\newcommand{\tbd}{\textit{TBD}}
+
+% ---- Listings style ----
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!10},
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!50!black},
+}
+
+% ---- Title ----
+\title{\textbf{Analytic Policy Gradients vs.\ Proximal Policy Optimization: \\ A Comparative Study on Differentiable Environments}}
+
+\author{
+  % Add author names here
+}
+
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+% ==============================================================================
+\begin{abstract}
+We investigate the learning efficiency of Analytic Policy Gradients (APG), a class of algorithms that exploit differentiable environment dynamics by backpropagating through the simulation to compute exact policy gradients. We compare APG against Proximal Policy Optimization (PPO), a widely-used model-free algorithm that treats the environment as a black box. Both algorithms are evaluated on three continuous control tasks of increasing complexity: point-mass navigation with obstacles, T-block pushing with planar rigid-body dynamics, and 6-DOF robotic reaching with the Franka FR3 manipulator. Our implementation supports fair comparison through shared neural network architectures, observation normalization, learning rate schedules, and multi-axis logging (by environment steps, gradient steps, and wall-clock time). We provide a detailed description of the algorithm design, environment dynamics, and gradient bridge mechanisms, and present result templates for systematic evaluation.
+\end{abstract}
+
+% ==============================================================================
+\section{Introduction}
+\label{sec:introduction}
+
+\subsection{Motivation}
+\label{sec:motivation}
+
+Reinforcement learning (RL) has achieved remarkable success across domains including game playing, robotics, and autonomous systems. However, sample efficiency remains a fundamental challenge. Model-free algorithms such as PPO~\cite{schulman2017ppo} require millions of environment interactions, as they treat the environment as a black box and rely solely on reward signals to estimate policy gradients via Monte Carlo returns or learned value functions.
+
+A largely overlooked opportunity is that many modern simulation environments are inherently differentiable. Physics engines, rendering pipelines, and procedural task generators often admit analytic derivatives. When these derivatives are available, we can compute exact policy gradients by backpropagating the return through the environment dynamics, bypassing the need for variance-reduction techniques like GAE~\cite{schulman2016gae}, value function baselines, or importance sampling corrections.
+
+\subsection{Contributions}
+\label{sec:contributions}
+
+This work makes the following contributions:
+
+\begin{enumerate}[label=\arabic*.]
+  \item \textbf{A unified APG/PPO training framework} (\texttt{rl.py}) that supports both black-box (PPO) and differentiable (APG) training modes with identical agent architectures, observation normalization, and evaluation protocols.
+
+  \item \textbf{Three benchmark environments} spanning a range of dynamical complexity:
+  \begin{itemize}
+    \item \textbf{PointMassNavigate-v0}: 2D point-mass with obstacle avoidance (analytic Euler integration)
+    \item \textbf{PushT-v0}: 2D T-block pushing with rigid-body dynamics (analytic Euler integration)
+    \item \textbf{FrankaReach-v0}: 6-DOF Franka FR3 end-effector reaching (Newton Physics with Warp gradient bridge)
+  \end{itemize}
+
+  \item \textbf{A Warp--PyTorch gradient bridge} for complex articulated-body dynamics, enabling analytic policy gradients through a GPU-accelerated physics solver via \texttt{torch.autograd.Function}.
+
+  \item \textbf{Multi-axis evaluation protocol} that logs metrics by environment steps, gradient steps, and wall-clock time, enabling fair comparison across algorithms with fundamentally different update structures.
+\end{enumerate}
+
+\subsection{Paper Organization}
+\label{sec:organization}
+
+The remainder of this report is organized as follows. Section~\ref{sec:preliminaries} covers preliminaries on policy gradient methods and PPO. Section~\ref{sec:methodology} describes the APG methodology in detail. Section~\ref{sec:environments} presents the three benchmark environments. Section~\ref{sec:experiments} details the experimental setup and provides result templates. Section~\ref{sec:conclusion} discusses findings and concludes.
+
+% ==============================================================================
+\section{Preliminaries}
+\label{sec:preliminaries}
+
+\subsection{Markov Decision Processes}
+\label{sec:mdp}
+
+We model the RL problem as a Markov Decision Process (MDP) defined by the tuple $(\cS, \cA, T, R, \gamma)$, where $\cS$ is the state space, $\cA$ is the action space, $T(s' \mid s, a)$ is the transition dynamics, $R(s, a)$ is the reward function, and $\gamma \in [0, 1)$ is the discount factor. A policy $\pi_{\btheta}(a \mid s)$ parameterized by $\btheta$ maps states to action distributions. The objective is to maximize the expected discounted return:
+\begin{equation}
+  J(\btheta) = \E_{\pi_{\btheta}}\left[\sum_{t=0}^{T} \gamma^t R(s_t, a_t)\right]
+  \label{eq:objective}
+\end{equation}
+
+\subsection{Proximal Policy Optimization (PPO)}
+\label{sec:ppo}
+
+PPO~\cite{schulman2017ppo} is a model-free, on-policy algorithm that optimizes a clipped surrogate objective:
+\begin{equation}
+  \cL^{\text{PPO}}(\btheta) = \E_t\left[\min\left(r_t(\btheta) \hat{A}_t, \; \text{clip}\left(r_t(\btheta), 1-\epsilon, 1+\epsilon\right) \hat{A}_t\right)\right]
+  \label{eq:ppo_loss}
+\end{equation}
+where $r_t(\btheta) = \frac{\pi_{\btheta}(a_t \mid s_t)}{\pi_{\btheta_{\text{old}}}(a_t \mid s_t)}$ is the probability ratio, $\hat{A}_t$ is the advantage estimate computed via Generalized Advantage Estimation (GAE)~\cite{schulman2016gae}, and $\epsilon$ is the clipping coefficient.
+
+PPO treats the environment as a \textbf{black box}: it collects trajectories using the current policy, estimates advantages from observed rewards, and updates the policy without any knowledge of environment dynamics. The total PPO loss combines the clipped policy objective, a value function loss, and an entropy bonus:
+\begin{equation}
+  \cL(\btheta) = \cL^{\text{PPO}}(\btheta) - c_1 \cL^{\text{VF}}(\btheta) + c_2 H(\pi_{\btheta})
+  \label{eq:ppo_total}
+\end{equation}
+
+\subsection{Analytic Policy Gradients}
+\label{sec:apg_concept}
+
+In contrast to black-box methods, APG exploits the differentiability of the environment dynamics $T$ and reward function $R$. When both are differentiable, the return becomes a differentiable function of the policy parameters:
+\begin{equation}
+  J(\btheta) = \sum_{t=0}^{T} \gamma^t R(s_t, a_t), \quad s_{t+1} = T(s_t, a_t), \quad a_t = f_{\btheta}(s_t)
+  \label{eq:apg_return}
+\end{equation}
+
+The gradient $\nabla_{\btheta} J(\btheta)$ can be computed exactly via automatic differentiation (backpropagation through time)~\cite{werbos1990bptt}, eliminating the need for advantage estimation, importance sampling, or variance reduction. This approach trades off generality (requires differentiable environments) for potentially higher gradient quality.
+
+% ==============================================================================
+\section{Methodology}
+\label{sec:methodology}
+
+\subsection{Algorithm Overview}
+\label{sec:algo_overview}
+
+We implement both PPO and APG within a single unified training script. The key algorithmic switch is the \texttt{-{}-algorithm \{ppo,apg\}} flag, which selects the training loop. Both algorithms share:
+\begin{itemize}
+  \item Identical agent network architecture (actor-critic with LayerNorm)
+  \item Observation normalization via running Welford statistics
+  \item Linear learning rate annealing
+  \item Adam optimizer with the same hyperparameters
+  \item Deterministic evaluation protocol
+\end{itemize}
+
+The fundamental difference is how gradients are obtained. Table~\ref{tab:ppo_vs_apg} summarizes the key distinctions.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Comparison of PPO and APG algorithm components.}
+  \label{tab:ppo_vs_apg}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    \textbf{Component} & \textbf{PPO} & \textbf{APG} \\
+    \midrule
+    Environment interaction  & \texttt{torch.no\_grad()}              & Computation graph preserved \\
+    Gradient source          & Clipped surrogate + GAE                & Backprop through dynamics \\
+    Value function           & Required (advantage estimation)        & Optional (segment bootstrapping) \\
+    Action sampling          & \texttt{Categorical}/\texttt{Normal.sample()} & \texttt{gumbel\_softmax()}/\texttt{rsample()} \\
+    Rollout buffer           & Stores $(o, a, \log p, r, V)$          & No buffer needed \\
+    Update structure         & Multiple epochs over stored batch      & Multiple grad steps with fresh rollouts \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{APG Training Loop}
+\label{sec:apg_loop}
+
+The APG training loop follows a \textbf{stateful rollout} paradigm: the environment is reset once and its state is carried forward across gradient steps. Each iteration performs the following:
+
+\begin{enumerate}
+  \item \textbf{Anneal temperature} (discrete actions) and learning rate.
+
+  \item For each gradient step (default: 8 per iteration):
+  \begin{itemize}
+    \item \textbf{Forward pass}: Execute a full episode (or segment) with differentiable actions, preserving the computation graph throughout.
+    \item \textbf{Segment return computation}: Accumulate discounted rewards within each segment.
+    \item \textbf{Bootstrapping}: Estimate future returns beyond each segment using either:
+    \begin{itemize}
+      \item \textbf{MC bootstrap}: Pre-computed backward accumulation of future segment rewards (detached).
+      \item \textbf{Critic bootstrap}: A learned value function $V(s)$ evaluated at segment boundaries (detached).
+    \end{itemize}
+    \item \textbf{Loss computation}: $\cL = -\frac{1}{N}\sum_{i=1}^{N} \sum_{k=0}^{K} (G_k + b_k)$, where $G_k$ is the discounted return within segment $k$ and $b_k$ is the bootstrap value.
+    \item \textbf{Backward pass}: \texttt{loss.backward()} computes analytic gradients through the entire dynamics chain.
+    \item \textbf{Gradient clipping and optimizer step}.
+  \end{itemize}
+
+  \item \textbf{Log metrics} across multiple axes (environment steps, gradient steps, wall time).
+\end{enumerate}
+
+Algorithm~\ref{alg:apg} provides the complete pseudocode for one APG training iteration.
+
+\begin{algorithm}[htbp]
+  \caption{APG Training Iteration}
+  \label{alg:apg}
+  \begin{algorithmic}[1]
+    \Require Policy $\pi_{\btheta}$, environment $E$, temperature $\tau$, learning rate $\eta$, segment length $L$
+    \For{$\text{grad\_step} = 1, \ldots, N_{\text{grad}}$}
+      \State $\nabla_{\btheta} \leftarrow 0$
+      \State $\text{obs} \leftarrow E.\text{current\_state}$
+      \For{segment $k = 0, \ldots, \lceil T / L \rceil - 1$}
+        \State $G_k \leftarrow 0$
+        \For{$t = 0, \ldots, L-1$}
+          \State $a_t \leftarrow \text{differentiable\_action}(\pi_{\btheta}, \text{obs}, \tau)$ \Comment{Gumbel-Softmax or rsample}
+          \State $\text{obs}', r_t \leftarrow E.\text{step}(a_t)$ \Comment{graph preserved}
+          \State $G_k \leftarrow G_k + \gamma^t \cdot r_t$
+          \State $\text{obs} \leftarrow \text{obs}'$
+        \EndFor
+        \State $\text{obs} \leftarrow \text{obs}.\text{detach()}$ \Comment{break gradient chain}
+        \State $b_k \leftarrow \text{bootstrap}(k)$ \Comment{MC or $V(s)$}
+        \State $\text{policy\_loss} \leftarrow \text{policy\_loss} - \text{mean}(G_k + b_k)$
+      \EndFor
+      \State $\text{loss} \leftarrow \text{policy\_loss} + c_v \cdot \text{critic\_loss}$ \Comment{optional critic}
+      \State $\text{loss}.\text{backward()}$
+      \State $\text{clip\_grad\_norm}\_(\btheta, \text{max\_norm})$
+      \State $\text{optimizer}.\text{step()}$
+    \EndFor
+  \end{algorithmic}
+\end{algorithm}
+
+\subsection{Differentiable Action Computation}
+\label{sec:diff_action}
+
+For APG, actions must be differentiable with respect to policy parameters. The implementation differs by action space type.
+
+\paragraph{Discrete actions (Gumbel-Softmax relaxation):}
+\begin{equation}
+  \ba = \text{GumbelSoftmax}\!\left(\text{logits}_{\btheta}(s),\, \tau\right) = \text{softmax}\!\left(\frac{\text{logits}_{\btheta}(s) + \bg}{\tau}\right)
+  \label{eq:gumbel}
+\end{equation}
+where $\bg \sim \text{Gumbel}(0, 1)$ and $\tau$ is a temperature parameter that is linearly annealed from $\tau_{\text{init}} = 1.0$ to $\tau_{\text{min}} = 0.1$ over training~\cite{jang2017gumbel}. At high temperature, actions are ``soft'' (near-uniform), providing well-conditioned gradients. At low temperature, the relaxation approaches a one-hot encoding, producing near-discrete actions.
+
+\paragraph{Continuous actions (reparameterization trick):}
+\begin{equation}
+  \ba = \bmu_{\btheta}(s) + \bsigma_{\btheta} \odot \bepsilon, \quad \bepsilon \sim \mathcal{N}(\mathbf{0}, \mathbf{I})
+  \label{eq:reparam}
+\end{equation}
+Gradients flow through both the mean $\bmu_{\btheta}(s)$ and the standard deviation $\bsigma_{\btheta} = \exp(\log \bsigma_{\btheta})$ into the environment.
+
+\subsection{Segmented Backpropagation}
+\label{sec:segmentation}
+
+For environments with long horizons, backpropagating through the full episode can lead to vanishing/exploding gradients. APG supports \textbf{segmentation}, where the episode is divided into segments of length $L_{\text{seg}}$, and the gradient chain is broken at segment boundaries:
+\begin{itemize}
+  \item Within each segment, gradients flow through the full dynamics chain.
+  \item At segment boundaries, observations and environment state are detached.
+  \item Future returns beyond each segment are estimated via a \textbf{bootstrap value}.
+\end{itemize}
+
+The implementation supports two bootstrap modes:
+
+\begin{enumerate}
+  \item \textbf{MC bootstrap}: Pre-computes future returns by backward accumulation of observed rewards from later segments. These rewards are detached (not differentiable) but provide a fixed target for the current segment's policy loss.
+
+  \item \textbf{Critic bootstrap}: Uses a learned value function $V_\phi(s)$ to estimate future returns at segment boundaries. The critic is trained concurrently via MSE loss against segment returns plus bootstrap values, using a separate (or shared) optimizer learning rate.
+\end{enumerate}
+
+\subsection{Gradient Bridge for Physics Simulation}
+\label{sec:gradient_bridge}
+
+For the FrankaReach environment, which uses the Newton Physics engine with GPU-accelerated Featherstone forward dynamics, gradients cannot flow natively through PyTorch. We implement a custom \texttt{torch.autograd.Function} (\texttt{\_NewtonStepFunc}) that bridges Warp's tape-based autodiff with PyTorch's autograd.
+
+\paragraph{Forward pass:}
+\begin{enumerate}
+  \item Convert PyTorch action tensors to Warp arrays.
+  \item Run Newton's forward kinematics within a \texttt{wp.Tape} context.
+  \item Compute the reward using a custom Warp kernel.
+  \item Return the reward and end-effector pose as detached PyTorch tensors.
+\end{enumerate}
+
+\paragraph{Backward pass:}
+\begin{enumerate}
+  \item Receive upstream gradients from PyTorch ($\partial L / \partial r$, $\partial L / \partial \bpf_{\text{eef}}$).
+  \item Replay the Warp tape in reverse to compute $\partial r / \partial \ba$ and $\partial \bpf_{\text{eef}} / \partial \ba$.
+  \item Return the action gradient to PyTorch's autograd graph.
+\end{enumerate}
+
+This bridge enables analytic policy gradients through complex articulated-body dynamics without requiring a differentiable physics engine in PyTorch.
+
+\subsection{Observation Normalization}
+\label{sec:obs_norm}
+
+Both algorithms use online observation normalization via a Welford-style running mean and standard deviation tracker (\texttt{RunningObsNormalizer}). Statistics are updated with detached observations after each rollout/gradient step, ensuring that normalization does not interfere with gradient flow in APG mode.
+
+\subsection{Agent Architecture}
+\label{sec:architecture}
+
+The policy network uses a shared architecture for both PPO and APG.
+
+\paragraph{Actor (continuous):}
+\[
+  \text{obs\_dim} \rightarrow \text{Linear}(64) \rightarrow \text{Tanh} \rightarrow \text{LayerNorm}(64) \rightarrow \text{Linear}(64) \rightarrow \text{Tanh} \rightarrow \text{LayerNorm}(64) \rightarrow \text{Linear}(\text{action\_dim})
+\]
+Plus a learnable $\log\sigma$ parameter (initialized to $-2.0$, giving $\sigma \approx 0.135$).
+
+\paragraph{Actor (discrete):}
+\[
+  \text{obs\_dim} \rightarrow \text{Linear}(64) \rightarrow \text{Tanh} \rightarrow \text{LayerNorm}(64) \rightarrow \text{Linear}(64) \rightarrow \text{Tanh} \rightarrow \text{LayerNorm}(64) \rightarrow \text{Linear}(n\_\text{actions})
+\]
+
+\paragraph{Critic (PPO and APG with critic bootstrap):}
+\[
+  \text{obs\_dim} \rightarrow \text{Linear}(64) \rightarrow \text{Tanh} \rightarrow \text{Linear}(64) \rightarrow \text{Tanh} \rightarrow \text{Linear}(1)
+\]
+
+All linear layers use orthogonal initialization with $\text{std} = \sqrt{2}$ (actor hidden layers) or $\text{std} = 0.01$ (output layer). The critic output uses $\text{std} = 1.0$.
+
+% ==============================================================================
+\section{Environments}
+\label{sec:environments}
+
+We evaluate on three continuous-control environments of increasing complexity, each implemented with both a black-box mode (PPO) and a differentiable mode (APG).
+
+\subsection{PointMassNavigate-v0}
+\label{sec:env_pointmass}
+
+\paragraph{Task:} Navigate a point mass from a random start to a random goal position while avoiding two randomly-placed circular obstacles.
+
+\paragraph{State space} (14-dimensional): See Table~\ref{tab:pm_obs}.
+
+\begin{table}[htbp]
+  \centering
+  \caption{PointMassNavigate-v0 observation space.}
+  \label{tab:pm_obs}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    \textbf{Component} & \textbf{Dimensions} & \textbf{Description} \\
+    \midrule
+    Position       & 2 & $(x, y) \in [-1, 1]^2$ \\
+    Velocity       & 2 & $(v_x, v_y)$ \\
+    Goal position  & 2 & Target $(x_g, y_g)$ \\
+    Last action    & 2 & Previous force command \\
+    Obstacle 1     & 3 & Position $(x_1, y_1)$ + radius $r_1$ \\
+    Obstacle 2     & 3 & Position $(x_2, y_2)$ + radius $r_2$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Action space:} $\cA = [-1, 1]^2$ (2D force vector, scaled by 5.0\,N).
+
+\paragraph{Dynamics} (semi-implicit Euler, $\Delta t = 1/60$\,s):
+\begin{align}
+  \bvf &\leftarrow \bvf \cdot (1 - c_d \Delta t) \\
+  \bvf &\leftarrow \bvf + \frac{\bff}{m} \Delta t \\
+  \bpf &\leftarrow \text{clamp}\!\left(\bpf + \bvf \Delta t,\; [-1, 1]^2\right)
+\end{align}
+where $m = 1.0$\,kg, $c_d = 5.0$, $\bff = \ba \times 5.0$\,N.
+
+\paragraph{Reward:}
+\begin{equation}
+  r = -\|\bpf - \bpf_g\| + 0.5\!\left(1 - \tanh\!\left(\frac{\|\bpf - \bpf_g\|}{0.05}\right)\right) - 0.01\|\bvf\|^2 - 0.001\|\ba - \ba_{\text{prev}}\|^2 - 2.0 \sum_{i=1}^{2} \max(0, r_i - d_i)^2
+  \label{eq:pm_reward}
+\end{equation}
+
+\paragraph{Success condition:} $\|\bpf - \bpf_g\| < 0.01$\,m.
+
+\paragraph{Episode length:} 100 steps (default).
+
+\paragraph{APG gradient path:} $\ba \rightarrow \bff \rightarrow \bvf \rightarrow \bpf \rightarrow r$ (fully differentiable Euler integration).
+
+\subsection{PushT-v0}
+\label{sec:env_pusht}
+
+\paragraph{Task:} Push a T-shaped rigid block from a random initial pose to a random goal pose using external forces and torques.
+
+\paragraph{State space} (9-dimensional): See Table~\ref{tab:pt_obs}.
+
+\begin{table}[htbp]
+  \centering
+  \caption{PushT-v0 observation space.}
+  \label{tab:pt_obs}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    \textbf{Component} & \textbf{Dimensions} & \textbf{Description} \\
+    \midrule
+    Block position        & 2 & $(x, y) \in [-0.25, 0.25]^2$ \\
+    Block angle           & 1 & $\theta \in [-\pi, \pi]$ \\
+    Goal position         & 2 & Target $(x_g, y_g)$ \\
+    Goal angle            & 1 & Target $\theta_g$ \\
+    Block velocity        & 2 & $(v_x, v_y)$ \\
+    Block angular velocity & 1 & $\omega$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Action space:} $\cA = [-1, 1]^3$ (force $x$, force $y$, torque $z$).
+
+\paragraph{T-block geometry:} Top bar: $0.12 \times 0.03$\,m. Stem: $0.03 \times 0.09$\,m. Total height $\approx 0.12$\,m.
+
+\paragraph{Dynamics} (2D rigid body Euler, $\Delta t = 1/60$\,s):
+\begin{align}
+  \bvf &\leftarrow \bvf \cdot (1 - c_d \Delta t), & \omega &\leftarrow \omega \cdot (1 - c_\omega \Delta t) \\
+  \bvf &\leftarrow \bvf + \frac{\bff}{m} \Delta t,  & \omega &\leftarrow \omega + \frac{\tau}{I} \Delta t \\
+  \bpf &\leftarrow \text{clamp}\!\left(\bpf + \bvf \Delta t,\; [-0.25, 0.25]^2\right), & \theta &\leftarrow \text{wrap}(\theta + \omega \Delta t)
+\end{align}
+where $m = 0.1$\,kg, $I = 1.95 \times 10^{-4}$\,kg$\cdot$m$^2$, $c_d = 5.0$, $c_\omega = 3.0$, $\bff = \ba_{[0:2]} \times 5.0$\,N, $\tau = a_{[2]} \times 0.2$\,Nm.
+
+\paragraph{Reward:}
+\begin{equation}
+  r = -\|\bpf - \bpf_g\| + 0.5\!\left(1 - \tanh\!\left(\frac{\|\bpf - \bpf_g\|}{0.02}\right)\right) - 0.5\,|\text{wrap}(\theta - \theta_g)| - 0.001\,\|\ba - \ba_{\text{prev}}\|^2
+  \label{eq:pt_reward}
+\end{equation}
+
+\paragraph{Success condition:} $\|\bpf - \bpf_g\| < 0.01$\,m and $|\text{wrap}(\theta - \theta_g)| < 0.1$\,rad.
+
+\paragraph{Episode length:} 100 steps (default).
+
+\paragraph{APG gradient path:} $\ba \rightarrow (\bff, \tau) \rightarrow (\bvf, \omega) \rightarrow (\bpf, \theta) \rightarrow r$.
+
+\subsection{FrankaReach-v0}
+\label{sec:env_franka}
+
+\paragraph{Task:} Control a 7-DOF Franka FR3 manipulator to reach a target 6D end-effector pose (position + orientation).
+
+\paragraph{State space} (28-dimensional): See Table~\ref{tab:fr_obs}.
+
+\begin{table}[htbp]
+  \centering
+  \caption{FrankaReach-v0 observation space.}
+  \label{tab:fr_obs}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    \textbf{Component} & \textbf{Dimensions} & \textbf{Description} \\
+    \midrule
+    Joint positions     & 7 & $q_1, \ldots, q_7$ (arm joints) \\
+    EEF position        & 3 & $(x, y, z)$ of end-effector \\
+    EEF quaternion      & 4 & $(x, y, z, w)$ orientation \\
+    Target position     & 3 & Goal $(x_g, y_g, z_g)$ \\
+    Target quaternion   & 4 & Goal orientation $(x_g, y_g, z_g, w_g)$ \\
+    Last action         & 7 & Previous joint velocity command \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Action space:} $\cA = [-1, 1]^7$ (delta joint positions, scaled by 0.2\,rad).
+
+\paragraph{Dynamics:} Newton Physics with Featherstone forward dynamics solver. Joint targets are computed as $q_{\text{target}} = \text{clamp}(q_{\text{current}} + \ba \times 0.2, \; q_{\text{min}}, q_{\text{max}})$.
+
+\paragraph{Target sampling:} Positions sampled uniformly in $x \in [0.05, 0.70]$, $y \in [-0.45, 0.45]$, $z \in [0.05, 0.95]$\,m. Orientations sampled with tilt up to $\pm 60^\circ$ from the default downward pose.
+
+\paragraph{Reward:}
+\begin{equation}
+  r = -0.2\,\|\bpf_{\text{eef}} - \bpf_{\text{target}}\| + 0.1\!\left(1 - \tanh\!\left(\frac{\|\bpf_{\text{eef}} - \bpf_{\text{target}}\|}{0.1}\right)\right) - 0.1 \cdot d_{\text{quat}}(\mathbf{q}_{\text{eef}}, \mathbf{q}_{\text{target}}) - 0.0001\,\|\ba - \ba_{\text{prev}}\|^2
+  \label{eq:fr_reward}
+\end{equation}
+
+\paragraph{Success condition:} $\|\bpf_{\text{eef}} - \bpf_{\text{target}}\| < 0.005$\,m and quaternion distance $< 0.1$.
+
+\paragraph{Episode length:} 30 steps (default).
+
+\paragraph{APG gradient path:} $\ba \rightarrow q_{\text{target}} \rightarrow \text{FK}(q) \rightarrow \bpf_{\text{eef}}, \mathbf{q}_{\text{eef}} \rightarrow r$.
+
+The gradient computation uses a custom \texttt{torch.autograd.Function} that bridges the Warp-tape autodiff in Newton Physics with PyTorch's autograd system (see Section~\ref{sec:gradient_bridge}).
+
+\subsection{Environment Complexity Comparison}
+\label{sec:env_comparison}
+
+Table~\ref{tab:env_comparison} compares the three environments across key properties.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Comparison of environment properties.}
+  \label{tab:env_comparison}
+  \begin{tabular}{@{}llll@{}}
+    \toprule
+    \textbf{Property} & \textbf{PointMass} & \textbf{PushT} & \textbf{FrankaReach} \\
+    \midrule
+    Observation dim        & 14                        & 9                          & 28 \\
+    Action dim             & 2                         & 3                          & 7 \\
+    Dynamics               & Point mass (Euler)        & 2D rigid body (Euler)      & Articulated body (Featherstone) \\
+    DOF                    & 2 (pos)                   & 3 (pos + rot)              & 7 (joints) \\
+    Max episode steps      & 100                       & 100                        & 30 \\
+    Gradient bridge        & Native PyTorch            & Native PyTorch             & Warp $\leftrightarrow$ PyTorch \\
+    Obstacles/constraints  & 2 circles                 & Workspace bounds           & Joint limits \\
+    Orientation            & No                        & Yes ($\theta$)             & Yes (quaternion) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ==============================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+\label{sec:setup}
+
+\paragraph{Shared hyperparameters} (identical for PPO and APG unless noted): See Table~\ref{tab:shared_hp}.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Shared hyperparameters.}
+  \label{tab:shared_hp}
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    \textbf{Hyperparameter} & \textbf{Value} \\
+    \midrule
+    Learning rate                   & $2.5 \times 10^{-4}$ \\
+    LR schedule                     & Linear annealing to 0 \\
+    Discount factor $\gamma$        & 0.99 \\
+    Max gradient norm               & 0.5 \\
+    Optimizer                       & Adam ($\epsilon = 10^{-5}$) \\
+    Observation normalization       & Welford running mean/std \\
+    Number of parallel envs         & 4 \\
+    Network architecture            & 2-layer MLP (64 units, Tanh, LayerNorm) \\
+    Total environment steps         & 500{,}000 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{PPO-specific hyperparameters:} See Table~\ref{tab:ppo_hp}.
+
+\begin{table}[htbp]
+  \centering
+  \caption{PPO-specific hyperparameters.}
+  \label{tab:ppo_hp}
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    \textbf{Hyperparameter} & \textbf{Value} \\
+    \midrule
+    Steps per rollout           & 128 \\
+    Minibatches                 & 4 \\
+    Update epochs               & 4 \\
+    GAE $\lambda$               & 0.95 \\
+    Clip coefficient $\epsilon$ & 0.2 \\
+    Value function coefficient  & 0.5 \\
+    Entropy coefficient         & 0.01 \\
+    Clipped value loss          & Yes \\
+    Advantage normalization     & Yes \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{APG-specific hyperparameters:} See Table~\ref{tab:apg_hp}.
+
+\begin{table}[htbp]
+  \centering
+  \caption{APG-specific hyperparameters.}
+  \label{tab:apg_hp}
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    \textbf{Hyperparameter} & \textbf{Value} \\
+    \midrule
+    Gradient steps per iteration   & 8 \\
+    Gumbel temp (init $\to$ min)   & $1.0 \to 0.1$ \\
+    Temperature annealing          & Linear \\
+    Per-parameter clip             & 1.0 \\
+    Segment length                 & Full episode \\
+    Bootstrap mode                 & MC \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Evaluation Protocol}
+\label{sec:eval_protocol}
+
+We employ a rigorous evaluation protocol to ensure fair comparison:
+
+\begin{enumerate}
+  \item \textbf{Deterministic evaluation:} At regular intervals, we run evaluation episodes using greedy actions (argmax for discrete, mean for continuous) in a separate black-box environment, measuring the true policy performance without exploration noise.
+
+  \item \textbf{Multi-axis logging:} Metrics are recorded against three independent axes:
+  \begin{itemize}
+    \item \textbf{Environment steps}: Total number of environment interactions (measures sample efficiency).
+    \item \textbf{Gradient steps}: Total number of optimizer updates (measures compute efficiency).
+    \item \textbf{Wall-clock time}: Elapsed training time in seconds (measures practical efficiency).
+  \end{itemize}
+
+  \item \textbf{Seed sweep:} Results are reported as mean $\pm$ std over multiple random seeds.
+\end{enumerate}
+
+\subsection{Results Templates}
+\label{sec:results}
+
+% ---- Table 1 ----
+\begin{table}[htbp]
+  \centering
+  \caption{Final performance (episodic return). Results reported as mean $\pm$ std over multiple seeds.}
+  \label{tab:final_return}
+  \begin{tabular}{@{}lcc@{}}
+    \toprule
+    \textbf{Environment} & \textbf{PPO (mean $\pm$ std)} & \textbf{APG (mean $\pm$ std)} \\
+    \midrule
+    PointMassNavigate-v0 & \tbd & \tbd \\
+    PushT-v0             & \tbd & \tbd \\
+    FrankaReach-v0       & \tbd & \tbd \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ---- Table 2 ----
+\begin{table}[htbp]
+  \centering
+  \caption{Sample efficiency (environment steps to reach performance threshold).}
+  \label{tab:sample_eff}
+  \begin{tabular}{@{}lcrrr@{}}
+    \toprule
+    \textbf{Environment} & \textbf{Threshold} & \textbf{PPO Steps} & \textbf{APG Steps} & \textbf{APG Speedup} \\
+    \midrule
+    PointMassNavigate-v0 & \tbd & \tbd & \tbd & \tbd \\
+    PushT-v0             & \tbd & \tbd & \tbd & \tbd \\
+    FrankaReach-v0       & \tbd & \tbd & \tbd & \tbd \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ---- Table 3 ----
+\begin{table}[htbp]
+  \centering
+  \caption{Gradient efficiency (gradient steps to reach performance threshold).}
+  \label{tab:grad_eff}
+  \begin{tabular}{@{}lcrrr@{}}
+    \toprule
+    \textbf{Environment} & \textbf{Threshold} & \textbf{PPO Grad Steps} & \textbf{APG Grad Steps} & \textbf{APG Speedup} \\
+    \midrule
+    PointMassNavigate-v0 & \tbd & \tbd & \tbd & \tbd \\
+    PushT-v0             & \tbd & \tbd & \tbd & \tbd \\
+    FrankaReach-v0       & \tbd & \tbd & \tbd & \tbd \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ---- Table 4 ----
+\begin{table}[htbp]
+  \centering
+  \caption{Wall-clock time to reach performance threshold (seconds).}
+  \label{tab:wall_time}
+  \begin{tabular}{@{}lcrrr@{}}
+    \toprule
+    \textbf{Environment} & \textbf{Threshold} & \textbf{PPO Time (s)} & \textbf{APG Time (s)} & \textbf{APG Speedup} \\
+    \midrule
+    PointMassNavigate-v0 & \tbd & \tbd & \tbd & \tbd \\
+    PushT-v0             & \tbd & \tbd & \tbd & \tbd \\
+    FrankaReach-v0       & \tbd & \tbd & \tbd & \tbd \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ---- Table 5 ----
+\begin{table}[htbp]
+  \centering
+  \caption{Ablation study: effect of APG segment length and bootstrap mode.}
+  \label{tab:ablation_seg}
+  \begin{tabular}{@{}clccc@{}}
+    \toprule
+    \textbf{Segment Length} & \textbf{Bootstrap} & \textbf{PointMass} & \textbf{PushT} & \textbf{FrankaReach} \\
+    \midrule
+    Full episode & ---       & \tbd & \tbd & \tbd \\
+    10           & MC        & \tbd & \tbd & \tbd \\
+    10           & Critic    & \tbd & \tbd & \tbd \\
+    5            & MC        & \tbd & \tbd & \tbd \\
+    5            & Critic    & \tbd & \tbd & \tbd \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ---- Table 6 ----
+\begin{table}[htbp]
+  \centering
+  \caption{Ablation study: effect of Gumbel-Softmax temperature schedule.}
+  \label{tab:ablation_temp}
+  \begin{tabular}{@{}ccccc@{}}
+    \toprule
+    \textbf{Init Temp} & \textbf{Min Temp} & \textbf{Schedule} & \textbf{PointMass} & \textbf{PushT} \\
+    \midrule
+    1.0 & 0.1 & Annealed & \tbd & \tbd \\
+    1.0 & 1.0 & Fixed    & \tbd & \tbd \\
+    0.5 & 0.1 & Annealed & \tbd & \tbd \\
+    0.1 & 0.1 & Fixed    & \tbd & \tbd \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Compute Resources}
+\label{sec:compute}
+
+Experiments were conducted on \tbd{} (GPU model, CPU, RAM). Training times per run: \tbd{}.
+
+% ==============================================================================
+\section{Discussion and Conclusion}
+\label{sec:conclusion}
+
+\subsection{Summary}
+\label{sec:summary}
+
+We presented a comprehensive comparison between Analytic Policy Gradients (APG) and Proximal Policy Optimization (PPO) on three differentiable control environments of increasing complexity. Our key findings are:
+
+% Fill in after experiments
+
+\begin{enumerate}
+  \item \textbf{Gradient quality:} APG computes exact policy gradients by backpropagating through the environment dynamics, eliminating the variance inherent in Monte Carlo advantage estimation. This is expected to result in more consistent policy improvement per gradient step, particularly in environments where the dynamics are smooth and well-conditioned.
+
+  \item \textbf{Sample efficiency trade-off:} PPO amortizes each environment interaction across multiple update epochs and minibatches (default: 4 epochs $\times$ 4 minibatches = 16 gradient steps per rollout). APG, by contrast, uses each interaction for exactly one gradient step. The per-sample efficiency of APG must therefore compensate for this asymmetry to achieve comparable or better wall-clock performance.
+
+  \item \textbf{Scalability with dynamics complexity:} We expect APG's advantage to be most pronounced in simpler environments (PointMassNavigate) where gradient chains are short and well-conditioned, and potentially diminish in complex articulated-body settings (FrankaReach) where gradient magnitudes may suffer from the long computational chains through forward kinematics.
+
+  \item \textbf{Warp--PyTorch bridge feasibility:} Our custom \texttt{torch.autograd.Function} demonstrates that analytic policy gradients are practical even for GPU-accelerated physics engines that do not natively support PyTorch autograd, broadening the applicability of APG beyond simple analytic environments.
+\end{enumerate}
+
+\subsection{Limitations}
+\label{sec:limitations}
+
+\begin{enumerate}
+  \item \textbf{Environment differentiability requirement:} APG fundamentally requires differentiable environment dynamics. This limits applicability to simulations and excludes real-world training or environments with non-differentiable components (contacts, collisions with discrete events).
+
+  \item \textbf{Gradient chain length:} Long episodes can lead to vanishing or exploding gradients despite segmentation. The effectiveness of APG may be sensitive to the choice of segment length and bootstrap strategy.
+
+  \item \textbf{Gumbel-Softmax approximation:} For discrete action spaces, the Gumbel-Softmax relaxation introduces a temperature-dependent approximation error. The choice of annealing schedule is a new hyperparameter that requires tuning.
+
+  \item \textbf{Compute overhead:} Maintaining the computation graph through environment rollouts incurs memory and compute overhead compared to PPO's detached rollouts, particularly for complex environments like FrankaReach.
+\end{enumerate}
+
+\subsection{Future Work}
+\label{sec:future}
+
+\begin{enumerate}
+  \item \textbf{Hybrid algorithms:} Combining APG's analytic gradients with PPO's stability mechanisms (clipping, multiple epochs) could yield algorithms that benefit from both gradient quality and robustness.
+
+  \item \textbf{Learned dynamics models:} When differentiable simulators are unavailable, APG could be applied to learned world models, using the model's differentiability as a proxy for true analytic gradients.
+
+  \item \textbf{Curriculum over segment length:} Dynamically adjusting the segment length during training---starting with short segments for stable gradients and gradually increasing as the policy improves---could improve APG's performance on long-horizon tasks.
+
+  \item \textbf{Extended benchmark suite:} Evaluation on additional environments (e.g., locomotion, manipulation with contact-rich dynamics) would further characterize APG's strengths and limitations.
+\end{enumerate}
+
+% ==============================================================================
+\section*{References}
+\label{sec:references}
+
+\begin{thebibliography}{9}
+
+\bibitem{schulman2017ppo}
+  Schulman, J., Wolski, F., Dhariwal, P., Radford, A., \& Klimov, O. (2017).
+  Proximal Policy Optimization Algorithms.
+  \textit{arXiv preprint arXiv:1707.06347}.
+
+\bibitem{schulman2016gae}
+  Schulman, J., Moritz, P., Levine, S., Abbeel, P., \& Jordan, M. (2016).
+  High-Dimensional Continuous Control Using Generalized Advantage Estimation.
+  \textit{ICLR 2016}.
+
+\bibitem{jang2017gumbel}
+  Jang, E., Gu, S., \& Poole, B. (2017).
+  Categorical Reparameterization with Gumbel-Softmax.
+  \textit{ICLR 2017}.
+
+\bibitem{werbos1990bptt}
+  Werbos, P.~J. (1990).
+  Backpropagation Through Time: What It Does and How to Do It.
+  \textit{Proceedings of the IEEE}, 78(10), 1550--1560.
+
+\end{thebibliography}
+
+% ==============================================================================
+\appendix
+
+\section{Hyperparameter Sensitivity}
+\label{sec:appendix_hp}
+
+% Fill in after ablation experiments
+
+\section{Training Curves}
+\label{sec:appendix_curves}
+
+% Insert learning curve figures here:
+% \begin{figure}[htbp]
+%   \centering
+%   \includegraphics[width=\textwidth]{figures/pointmass_curves.png}
+%   \caption{PointMassNavigate-v0 training curves. Left: episodic return vs.\ environment steps.
+%     Center: episodic return vs.\ gradient steps. Right: episodic return vs.\ wall-clock time.}
+%   \label{fig:pm_curves}
+% \end{figure}
+
+\section{Environment Visualizations}
+\label{sec:appendix_vis}
+
+% Insert example rendered frames or episode GIFs for each environment
+
+\end{document}

@@ -43,7 +43,7 @@ FRANKA_NUM_JOINTS = len(DEFAULT_JOINT_Q)
 TARGET_POS_RANGE = {
     "x": (0.05, 0.70),
     "y": (-0.45, 0.45),
-    "z": (0.05, 0.95),
+    "z": (0.2, 0.95),
 }
 # Maximum tilt angle (radians) from the default downward orientation.
 # 0 = EE straight down; pi = any orientation.
@@ -250,19 +250,33 @@ def _sample_target(num_envs, device="cpu"):
     sin_ht = torch.sin(half_tilt)
     cos_ht = torch.cos(half_tilt)
     # Delta quaternion from identity: q_delta = [sin_ht*cos_phi, sin_ht*sin_phi, 0, cos_ht]
-    q_delta = torch.stack([sin_ht * cos_phi, sin_ht * sin_phi,
-                           torch.zeros(num_envs, device=device), cos_ht], dim=-1)
+    q_delta = torch.stack(
+        [
+            sin_ht * cos_phi,
+            sin_ht * sin_phi,
+            torch.zeros(num_envs, device=device),
+            cos_ht,
+        ],
+        dim=-1,
+    )
     # Base orientation (EE down): [1, 0, 0, 0]
-    q_base = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device).unsqueeze(0).expand(num_envs, -1)
+    q_base = (
+        torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)
+        .unsqueeze(0)
+        .expand(num_envs, -1)
+    )
     # Quaternion multiply: q_result = q_delta * q_base
     dx, dy, dz, dw = q_delta[:, 0], q_delta[:, 1], q_delta[:, 2], q_delta[:, 3]
     bx, by, bz, bw = q_base[:, 0], q_base[:, 1], q_base[:, 2], q_base[:, 3]
-    target_quat = torch.stack([
-        dw * bx + dx * bw + dy * bz - dz * by,
-        dw * by - dx * bz + dy * bw + dz * bx,
-        dw * bz + dx * by - dy * bx + dz * bw,
-        dw * bw - dx * bx - dy * by - dz * bz,
-    ], dim=-1)
+    target_quat = torch.stack(
+        [
+            dw * bx + dx * bw + dy * bz - dz * by,
+            dw * by - dx * bz + dy * bw + dz * bx,
+            dw * bz + dx * by - dy * bx + dz * bw,
+            dw * bw - dx * bx - dy * by - dz * bz,
+        ],
+        dim=-1,
+    )
     # Normalize
     target_quat = target_quat / target_quat.norm(dim=-1, keepdim=True)
     return target_pos, target_quat
@@ -282,13 +296,17 @@ def _compute_reward(
 
     Terms (weights match IsaacLab RewardsCfg, joint_vel term omitted):
       - position_tracking:             -0.2  * ||pos_ee - pos_cmd||
-      - position_tracking_fine_grained: +0.1 * (1 - tanh(dist / 0.1))
+      - position_tracking_fine_grained: +0.1 * exp(-dist^2 / (2*0.1^2))
       - orientation_tracking:          -0.1  * quat_dist(q_ee, q_cmd)
       - action_rate:                   -1e-4 * ||action - prev_action||^2
     """
     pos_dist = (eef_pos - target_pos).norm(dim=-1)
     rot_dist = _quat_distance(eef_quat, target_quat)
-    reward = -0.2 * pos_dist + 0.1 * (1.0 - torch.tanh(pos_dist / 0.1)) - 0.1 * rot_dist
+    reward = (
+        -0.2 * pos_dist
+        + 0.1 * torch.exp(-(pos_dist**2) / (2 * 0.1**2))
+        - 0.1 * rot_dist
+    )
     if action is not None and last_action is not None:
         action_rate = ((action - last_action) ** 2).sum(dim=-1)
         reward = reward - 0.0001 * action_rate
@@ -510,7 +528,17 @@ class FrankaReachVecEnv:
         terminated = self._check_success()
         done_mask = truncated | terminated
 
-        infos = {}
+        # Compute EEF distance for infos before auto-reset
+        body_q_t = wp.to_torch(self.state_0.body_q).view(self._num_envs, -1, 7)
+        eef_pose = body_q_t[
+            torch.arange(self._num_envs, device=self.device),
+            self.ee_body_indices,
+        ]
+        infos = {
+            "final_distance": (eef_pose[:, :3] - self.target_pos).norm(dim=-1).detach(),
+            "success": terminated.detach(),
+        }
+
         if done_mask.any():
             reset_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
             obs, _ = self.reset(reset_ids)
@@ -702,7 +730,9 @@ def _set_joint_targets_kernel(
         j = tid % num_arm_joints
         q_offset = env_idx * num_joints_per_env + j
         new_q = current_q[q_offset] + action[tid] * action_scale
-        target_pos[q_offset] = wp.clamp(new_q, joint_limit_lower[j], joint_limit_upper[j])
+        target_pos[q_offset] = wp.clamp(
+            new_q, joint_limit_lower[j], joint_limit_upper[j]
+        )
 
 
 @wp.kernel
@@ -751,7 +781,7 @@ def _compute_full_reward_kernel(
 
     reward_out[env_idx] = (
         wp.float32(-0.2) * pos_dist
-        + wp.float32(0.1) * (wp.float32(1.0) - wp.tanh(pos_dist / wp.float32(0.1)))
+        + wp.float32(0.1) * wp.exp(-pos_dist * pos_dist / wp.float32(0.02))
         - wp.float32(0.1) * rot_dist
         - wp.float32(0.0001) * action_rate
     )
@@ -878,9 +908,9 @@ class _NewtonStepFunc(torch.autograd.Function):
         # EEF poses from FK (detached — gradient through eef requires a second
         # Warp tape pass and is left for future work; jpos gradient is handled
         # in PyTorch by the caller)
-        body_q_torch = wp.to_torch(fk_state.body_q)       # [total_bodies, 7]
-        ee_indices_t = wp.to_torch(ee_indices_wp).long()   # [num_envs]
-        eef_poses = body_q_torch[ee_indices_t].detach()    # [num_envs, 7]
+        body_q_torch = wp.to_torch(fk_state.body_q)  # [total_bodies, 7]
+        ee_indices_t = wp.to_torch(ee_indices_wp).long()  # [num_envs]
+        eef_poses = body_q_torch[ee_indices_t].detach()  # [num_envs, 7]
 
         # Save for backward
         ctx.tape = tape
@@ -998,17 +1028,27 @@ class FrankaReachAPGEnv(FrankaReachVecEnv):
         self._render_current_state()
 
         # Build obs: jpos is differentiable through action; eef/target/last_action detached.
-        obs = torch.cat([
-            new_jpos,
-            eef_poses,
-            self.target_pos,
-            self.target_quat,
-            self.last_action,
-        ], dim=-1)
+        obs = torch.cat(
+            [
+                new_jpos,
+                eef_poses,
+                self.target_pos,
+                self.target_quat,
+                self.last_action,
+            ],
+            dim=-1,
+        )
 
         truncated = self.step_count >= self.max_episode_steps
         terminated = self._check_success()
         done_mask = truncated | terminated
+
+        infos = {
+            "final_distance": (eef_poses[:, :3] - self.target_pos)
+            .norm(dim=-1)
+            .detach(),
+            "success": terminated.detach(),
+        }
 
         if done_mask.any():
             reset_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -1017,7 +1057,7 @@ class FrankaReachAPGEnv(FrankaReachVecEnv):
             fresh_obs = self._get_obs()
             obs = torch.where(done_mask.unsqueeze(-1).expand_as(obs), fresh_obs, obs)
 
-        return obs, reward, terminated, truncated, {}
+        return obs, reward, terminated, truncated, infos
 
 
 if __name__ == "__main__":
@@ -1031,9 +1071,9 @@ if __name__ == "__main__":
 
     action = torch.randn(env.num_envs, FRANKA_NUM_ARM_JOINTS)
     obs, reward, terminated, truncated, infos = env.step(action)
-    obs_apg, reward_apg, terminated_apg, truncated_apg, infos_apg = env_apg.step(
-        action
-    )
-    from IPython import embed; embed()
+    obs_apg, reward_apg, terminated_apg, truncated_apg, infos_apg = env_apg.step(action)
+    from IPython import embed
+
+    embed()
     env.close()
     env_apg.close()
