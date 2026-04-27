@@ -47,7 +47,7 @@ class Args:
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = True
+    capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     headless: bool = True
     """whether to run custom environments without an interactive viewer window"""
@@ -105,7 +105,7 @@ class Args:
     """minimum temperature for Gumbel-Softmax"""
     apg_anneal_temp: bool = True
     """whether to anneal Gumbel-Softmax temperature over training"""
-    apg_num_grad_steps: int = 16
+    apg_num_grad_steps: int = 8
     """number of gradient steps per iteration"""
     apg_per_param_clip: float = 1.0
     """per-parameter gradient clipping before optimizer"""
@@ -123,7 +123,7 @@ class Args:
     # Comparison
     max_episode_steps: int = 30
     """max episode steps for custom environments"""
-    equalize_grad_steps: bool = True
+    equalize_grad_steps: bool = False
     """scale APG iterations so total gradient steps match PPO"""
 
     # Seed sweep & evaluation

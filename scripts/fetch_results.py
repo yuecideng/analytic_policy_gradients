@@ -122,25 +122,6 @@ for env_name, ppo_exp, apg_exp in TABLE1_GROUPS:
     apg_vals = get_final_returns(data_cache[apg_exp])
     print(f"    {env_name:<25} & {fmt(ppo_vals):<30} & {fmt(apg_vals)} \\\\")
 
-# TABLE 2
-print("\n% === TABLE 2: Sample efficiency (env steps to threshold) ===")
-for env_name, ppo_exp, apg_exp in TABLE1_GROUPS:
-    thr = THRESHOLDS[env_name]
-    ppo_s = steps_to_threshold(data_cache[ppo_exp], thr, "eval/episodic_return")
-    apg_s = steps_to_threshold(data_cache[apg_exp], thr, "eval/episodic_return")
-    print(
-        f"    {env_name:<25} & {thr} & {fmt_steps(ppo_s):<12} & {fmt_steps(apg_s):<12} & {fmt_speedup(ppo_s, apg_s)} \\\\"
-    )
-
-# TABLE 3
-print("\n% === TABLE 3: Compute efficiency (grad steps to threshold) ===")
-for env_name, ppo_exp, apg_exp in TABLE1_GROUPS:
-    thr = THRESHOLDS[env_name]
-    ppo_g = steps_to_threshold(data_cache[ppo_exp], thr, "by_grad_steps/eval_return")
-    apg_g = steps_to_threshold(data_cache[apg_exp], thr, "by_grad_steps/eval_return")
-    print(
-        f"    {env_name:<25} & {thr} & {fmt_steps(ppo_g):<12} & {fmt_steps(apg_g):<12} & {fmt_speedup(ppo_g, apg_g)} \\\\"
-    )
 
 # TABLE 4
 print("\n% === TABLE 4: Ablation (episodic return) ===")

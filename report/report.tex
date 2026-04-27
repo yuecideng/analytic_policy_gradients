@@ -604,9 +604,9 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
     \textbf{Environment} & \textbf{PPO (mean $\pm$ std)} & \textbf{APG (mean $\pm$ std)} \\
     \midrule
     MountainCarContinuous & \tbd & \tbd \\
-    PointMassNavigate & $-64.89 \pm 11.92$ & $-5.25 \pm 3.36$ \\
+    PointMassNavigate & $-64.89 \pm 11.92$ & $-14.59 \pm 3.36$ \\
     PushT             & $-2.47 \pm 4.69$   & $-0.64 \pm 0.28$ \\
-    FrankaReach       & $0.02 \pm 0.25$    & $0.92 \pm 0.33$ \\
+    FrankaReach       & $-0.64 \pm 0.44$    & $0.30 \pm 0.03$ \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -621,8 +621,8 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
     \textbf{Environment} & \textbf{Success Ratio} & \textbf{PPO Steps} & \textbf{APG Steps} & \textbf{APG Speedup} \\
     \midrule
     MountainCarContinuous & \tbd & \tbd & \tbd & \tbd \\
-    PointMassNavigate & \tbd & \tbd & \tbd & \tbd \\
-    PushT             & \tbd & \tbd & \tbd & \tbd \\
+    PointMassNavigate & 20\% & 263360 & 192000 & 1.37x \\
+    PushT             & 100\% & 147456 & 138240 & 1.07x \\
     FrankaReach       & 20\% & 1000000 & 230400 & 4.34x \\
     \bottomrule
   \end{tabular}
@@ -638,9 +638,9 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
     \textbf{Environment} & \textbf{Success Ratio} & \textbf{PPO Grad Steps} & \textbf{APG Grad Steps} & \textbf{APG Speedup} \\
     \midrule
     MountainCarContinuous & \tbd & \tbd & \tbd & \tbd \\
-    PointMassNavigate & \tbd & \tbd & \tbd & \tbd \\
-    PushT             & \tbd & \tbd & \tbd & \tbd \\
-    FrankaReach       & 20\% & 3824 & 240 & 15.9x \\
+    PointMassNavigate & 20\% & 1104 & 120 & 9.2x \\
+    PushT             & 100\% & 560 & 144 & 3.89x \\
+    FrankaReach       & 20\% & 3824 & 240 & 15.93x \\
     \bottomrule
   \end{tabular}
 \end{table}
