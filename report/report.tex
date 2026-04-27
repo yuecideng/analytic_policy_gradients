@@ -589,8 +589,21 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
 
 \begin{figure}[htbp]
   \centering
-  \includegraphics[width=\textwidth]{../figures/return_curves}
-  \caption{Episodic return (mean $\pm$ std, 5 seeds) vs.\ total gradient steps for PPO (blue) and APG (orange) across four environments. The x-axis is equalized: both algorithms execute the same total number of gradient updates.}
+  \begin{subfigure}[b]{0.32\textwidth}
+    \includegraphics[width=\textwidth]{../figures/point_mass}
+    \caption{PointMassNavigate}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.32\textwidth}
+    \includegraphics[width=\textwidth]{../figures/push_t}
+    \caption{PushT}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.32\textwidth}
+    \includegraphics[width=\textwidth]{../figures/franka_reach}
+    \caption{FrankaReach}
+  \end{subfigure}
+  \caption{Episodic return (mean $\pm$ std) vs.\ total gradient steps for PPO (blue) and APG (orange) across three environments. The x-axis is equalized: both algorithms execute the same total number of gradient updates.}
   \label{fig:return_curves}
 \end{figure}
 
@@ -605,8 +618,8 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
     \midrule
     MountainCarContinuous & \tbd & \tbd \\
     PointMassNavigate & $-64.89 \pm 11.92$ & $-14.59 \pm 3.36$ \\
-    PushT             & $-2.47 \pm 4.69$   & $-0.64 \pm 0.28$ \\
-    FrankaReach       & $-0.64 \pm 0.44$    & $0.30 \pm 0.03$ \\
+    PushT             & $-12.29 \pm 12.13$   & $0.29 \pm 0.76$ \\
+    FrankaReach       & $-0.09 \pm 0.13$    & $0.73 \pm 0.08$ \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -797,11 +810,50 @@ We presented a unified framework for comparing Analytic Policy Gradients (APG) a
 \section{Training Curves}
 \label{sec:appendix_curves}
 
-See Figure~\ref{fig:return_curves} in Section~\ref{sec:results} for the return curves (mean $\pm$ std, 5 seeds) plotted against total gradient steps for all four environments.
+Figures~\ref{fig:curve_pointmass}--\ref{fig:curve_franka} show the per-environment episodic return curves (mean $\pm$ std) at larger scale.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.7\textwidth]{../figures/point_mass}
+  \caption{PointMassNavigate v0: episodic return (mean $\pm$ std, 5 seeds) vs.\ global steps.}
+  \label{fig:curve_pointmass}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.7\textwidth]{../figures/push_t}
+  \caption{PushT v0: episodic return (mean $\pm$ std, 3 seeds) vs.\ global steps.}
+  \label{fig:curve_pusht}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.7\textwidth]{../figures/franka_reach}
+  \caption{FrankaReach v0: episodic return (mean $\pm$ std, 5 seeds) vs.\ global steps.}
+  \label{fig:curve_franka}
+\end{figure}
 
 \section{Environment Visualizations}
 \label{sec:appendix_vis}
 
-% Insert example rendered frames or episode GIFs for each environment
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[b]{0.3\textwidth}
+    \includegraphics[width=\textwidth]{../figures/point_mass_env}
+    \caption{PointMassNavigate v0: blue dot = agent, green star = goal, pink circles = obstacles.}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.3\textwidth}
+    \includegraphics[width=\textwidth]{../figures/push_t_env}
+    \caption{PushT v0: dark gray = T-block (agent-controlled), light green = target pose.}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.35\textwidth}
+    \includegraphics[width=\textwidth]{../figures/franka_env}
+    \caption{FrankaReach v0: 32 parallel Franka Emika Panda arms simulated via Newton physics.}
+  \end{subfigure}
+  \caption{Rendered frames from the three custom differentiable environments used in experiments.}
+  \label{fig:env_vis}
+\end{figure}
 
 \end{document}

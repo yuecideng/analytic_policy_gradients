@@ -272,7 +272,7 @@ class PushTVecEnv:
         max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
         device: str = "cpu",
         headless: bool = True,
-        capture_video: bool = True,
+        capture_video: bool = False,
         video_dir: str = "videos",
     ):
         self._num_envs = num_envs

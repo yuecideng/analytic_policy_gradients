@@ -227,7 +227,7 @@ def _create_eval_envs(args, device, run_name=""):
         num_envs=args.num_envs,
         algorithm="ppo",  # Always use black-box factory for eval
         device=device,
-        headless=True,
+        headless=False,
         max_episode_steps=args.max_episode_steps,
         capture_video=args.capture_video,
         video_dir=video_dir,
@@ -258,7 +258,7 @@ def deterministic_eval(
     completed_lengths = []
     completed_successes = []
     completed_final_dists = []
-
+    from IPython import embed; embed()
     obs, _ = eval_envs.reset()
     obs = obs.to(device)
     ep_ret = torch.zeros(eval_envs.num_envs, dtype=torch.float32, device=device)
@@ -277,6 +277,7 @@ def deterministic_eval(
                 action = agent.actor_mean(norm_obs).clamp(-1.0, 1.0)
 
         obs, reward, terminated, truncated, infos = eval_envs.step(action)
+        time.sleep(0.05)  # Add slight delay for better video rendering (if enabled)
         obs = obs.to(device)
         reward = reward.to(device)
         terminated = terminated.to(device)
