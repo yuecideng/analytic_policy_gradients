@@ -130,7 +130,7 @@ class Args:
     num_seeds: int = 1
     """number of seeds to sweep (runs training N times with seeds 1..N)"""
     eval_freq: int = 0
-    """evaluate every N iterations (0 = disabled)"""
+    """evaluate every N iterations (0 = disabled; computed as num_iterations // 10 at runtime)"""
     eval_episodes: int = 10
     """number of episodes per deterministic evaluation"""
 
@@ -1220,6 +1220,9 @@ if __name__ == "__main__":
         print(
             f"PPO: minibatch_size={args.minibatch_size}, num_iterations={args.num_iterations}"
         )
+
+    if args.eval_freq == 0 and args.num_iterations > 0:
+        args.eval_freq = max(args.num_iterations // 10, 1)
 
     seeds = list(range(1, args.num_seeds + 1)) if args.num_seeds > 1 else [args.seed]
     for seed_idx, seed in enumerate(seeds):
