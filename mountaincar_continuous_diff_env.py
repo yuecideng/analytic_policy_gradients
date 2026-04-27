@@ -27,7 +27,9 @@ def _set_local_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _format_action(action: torch.Tensor | np.ndarray | list, device: torch.device) -> torch.Tensor:
+def _format_action(
+    action: torch.Tensor | np.ndarray | list, device: torch.device
+) -> torch.Tensor:
     action_t = torch.as_tensor(action, dtype=torch.float32, device=device)
     if action_t.ndim == 1:
         action_t = action_t.unsqueeze(-1)
@@ -57,7 +59,9 @@ def _transition(
     next_position = torch.clamp(next_position, MIN_POSITION, MAX_POSITION)
 
     hit_left_wall = (next_position <= MIN_POSITION) & (next_velocity < 0.0)
-    next_velocity = torch.where(hit_left_wall, torch.zeros_like(next_velocity), next_velocity)
+    next_velocity = torch.where(
+        hit_left_wall, torch.zeros_like(next_velocity), next_velocity
+    )
     return next_position, next_velocity
 
 
@@ -79,7 +83,12 @@ def _compute_reward(
         normalized_position = torch.clamp(normalized_position, 0.0, 1.2)
         goal_bonus = torch.sigmoid((position - GOAL_POSITION) / 0.02)
         velocity_term = velocity / MAX_SPEED
-        return 2.0 * normalized_position + 4.0 * goal_bonus + 0.5 * velocity_term - action_penalty
+        return (
+            2.0 * normalized_position
+            + 4.0 * goal_bonus
+            + 0.5 * velocity_term
+            - action_penalty
+        )
 
     raise ValueError(f"Unsupported reward_mode: {reward_mode}")
 
@@ -112,10 +121,18 @@ class _MountainCarContinuousBaseEnv:
             dtype=np.float32,
         )
 
-        self.position = torch.zeros(self._num_envs, dtype=torch.float32, device=self.device)
-        self.velocity = torch.zeros(self._num_envs, dtype=torch.float32, device=self.device)
-        self.step_count = torch.zeros(self._num_envs, dtype=torch.int32, device=self.device)
-        self.last_action = torch.zeros(self._num_envs, 1, dtype=torch.float32, device=self.device)
+        self.position = torch.zeros(
+            self._num_envs, dtype=torch.float32, device=self.device
+        )
+        self.velocity = torch.zeros(
+            self._num_envs, dtype=torch.float32, device=self.device
+        )
+        self.step_count = torch.zeros(
+            self._num_envs, dtype=torch.int32, device=self.device
+        )
+        self.last_action = torch.zeros(
+            self._num_envs, 1, dtype=torch.float32, device=self.device
+        )
 
     @property
     def num_envs(self) -> int:
@@ -143,7 +160,9 @@ class _MountainCarContinuousBaseEnv:
         velocity = self.velocity if velocity is None else velocity
         return torch.stack((position, velocity), dim=-1)
 
-    def _reset_selected(self, env_ids_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _reset_selected(
+        self, env_ids_t: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         position, velocity = self._sample_reset_state(env_ids_t.numel())
         self.position[env_ids_t] = position
         self.velocity[env_ids_t] = velocity
@@ -164,7 +183,9 @@ class _MountainCarContinuousBaseEnv:
 
     def _step_impl(self, action, preserve_grad: bool):
         action_t = _format_action(action, self.device)
-        next_position, next_velocity = _transition(self.position, self.velocity, action_t)
+        next_position, next_velocity = _transition(
+            self.position, self.velocity, action_t
+        )
         reward = _compute_reward(
             next_position,
             next_velocity,

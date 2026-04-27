@@ -123,7 +123,7 @@ class Args:
     # Comparison
     max_episode_steps: int = 30
     """max episode steps for custom environments"""
-    equalize_grad_steps: bool = True
+    equalize_grad_steps: bool = False
     """scale APG iterations so total gradient steps match PPO"""
 
     # Seed sweep & evaluation
@@ -588,6 +588,7 @@ def _run_training(args, seed):
         # ========== PPO Training Loop ==========
         episode_count = 0
         total_grad_steps = 0
+        total_optim_steps = 0
 
         obs_dim = np.array(envs.single_observation_space.shape).prod()
         obs_normalizer = RunningObsNormalizer(obs_dim, device)
@@ -678,7 +679,7 @@ def _run_training(args, seed):
                         and episode_count % args.print_every_n_episodes == 0
                     ):
                         print(
-                            f"global_step={global_step}, episodic_return={avg_ret:.5f}, episodic_length={avg_len}"
+                            f"global_step={global_step}, total_optim_steps={total_optim_steps}, episodic_return={avg_ret:.5f}, episodic_length={avg_len}"
                         )
 
                 # Reset tracking for done environments
@@ -783,6 +784,7 @@ def _run_training(args, seed):
                     nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                     optimizer.step()
                     total_grad_steps += 1
+                    total_optim_steps += 1
 
                 if args.target_kl is not None and approx_kl > args.target_kl:
                     break
@@ -809,6 +811,9 @@ def _run_training(args, seed):
             writer.add_scalar("charts/SPS", int(global_step / elapsed), global_step)
             # Multi-axis logging for fair PPO vs APG comparison
             writer.add_scalar("charts/total_grad_steps", total_grad_steps, global_step)
+            writer.add_scalar(
+                "charts/total_optim_steps", total_optim_steps, global_step
+            )
             writer.add_scalar("charts/wall_time", elapsed, global_step)
             writer.add_scalar("perf/iter_time_sec", iter_elapsed, global_step)
             writer.add_scalar(
@@ -849,6 +854,7 @@ def _run_training(args, seed):
         # and linear LR annealing (matching PPO schedule for fair comparison).
         episode_count = 0
         total_grad_steps = 0
+        total_optim_steps = 0
 
         obs_dim = np.array(envs.single_observation_space.shape).prod()
         obs_normalizer = RunningObsNormalizer(obs_dim, device)
@@ -882,6 +888,7 @@ def _run_training(args, seed):
 
             for grad_step in range(args.apg_num_grad_steps):
                 total_grad_steps += 1
+                total_optim_steps += 1
 
                 optimizer.zero_grad()
 
@@ -984,7 +991,7 @@ def _run_training(args, seed):
                                 and episode_count % args.print_every_n_episodes == 0
                             ):
                                 print(
-                                    f"global_step={global_step}, episodic_return={avg_ret:.5f}, episodic_length={avg_len}"
+                                    f"global_step={global_step}, total_optim_steps={total_optim_steps}, episodic_return={avg_ret:.5f}, episodic_length={avg_len}"
                                 )
 
                         current_ep_ret[done_mask] = 0.0
@@ -1143,6 +1150,9 @@ def _run_training(args, seed):
 
             writer.add_scalar("charts/SPS", int(global_step / elapsed), global_step)
             writer.add_scalar("charts/total_grad_steps", total_grad_steps, global_step)
+            writer.add_scalar(
+                "charts/total_optim_steps", total_optim_steps, global_step
+            )
             writer.add_scalar("charts/wall_time", elapsed, global_step)
             writer.add_scalar("perf/iter_time_sec", iter_elapsed, global_step)
             writer.add_scalar(
@@ -1187,6 +1197,11 @@ def _run_training(args, seed):
             auc = np.trapezoid(sr, gs / gs[-1])
             writer.add_scalar("summary/auc_success_rate", auc, 0)
             print(f"  AUC (success rate): {auc:.6f}")
+
+    print(
+        f"  Total optimization steps: {total_optim_steps} "
+        f"(global_step={global_step})"
+    )
 
     if eval_envs is not None:
         eval_envs.close()

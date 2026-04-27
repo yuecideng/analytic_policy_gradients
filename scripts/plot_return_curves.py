@@ -5,10 +5,12 @@ Reads TensorBoard event files from runs/ and saves figures to figures/.
 Usage:
     conda run -n py311 python scripts/plot_return_curves.py
 """
+
 import os
 import glob
 import numpy as np
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -20,9 +22,9 @@ os.makedirs(OUT_DIR, exist_ok=True)
 METRIC = "by_grad_steps/eval_return"
 
 ENVS = [
-    ("PointMassNavigate-v0", "ppo_pm",    "apg_pm",    "PointMass Navigate"),
-    ("PushT-v0",             "ppo_pusht", "apg_pusht", "Push-T"),
-    ("FrankaReach-v0",       "ppo_franka","apg_franka","Franka Reach"),
+    ("PointMassNavigate-v0", "ppo_pm", "apg_pm", "PointMass Navigate"),
+    ("PushT-v0", "ppo_pusht", "apg_pusht", "Push-T"),
+    ("FrankaReach-v0", "ppo_franka", "apg_franka", "Franka Reach"),
 ]
 
 

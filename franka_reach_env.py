@@ -27,8 +27,8 @@ FRANKA_EE_BODY_NAME = "fr3_hand_tcp"  # last link (flange) in fr3.urdf
 DEFAULT_ACTION_SCALE = 0.2  # radians - very small for physics stability
 DEFAULT_MAX_EPISODE_STEPS = 30
 DEFAULT_W_ROT = 1.0
-DEFAULT_SUCCESS_POS_THRESHOLD = 0.005  # meters
-DEFAULT_SUCCESS_ROT_THRESHOLD = 0.1  # quaternion distance
+DEFAULT_SUCCESS_POS_THRESHOLD = 0.01  # meters
+DEFAULT_SUCCESS_ROT_THRESHOLD = 0.3  # quaternion distance
 WORLD_OFFSET = 1.5
 
 # Default initial joint configuration for Franka (home position):

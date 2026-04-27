@@ -64,7 +64,10 @@ except ImportError:
     _pointmass_simple_spec = None
 
 try:
-    from mountaincar_continuous_diff_env import MountainCarContinuousAPGEnv,MountainCarContinuousVecEnv
+    from mountaincar_continuous_diff_env import (
+        MountainCarContinuousAPGEnv,
+        MountainCarContinuousVecEnv,
+    )
 
     _diff_mountaincar_spec = EnvSpec(
         ppo_factory=lambda **kw: MountainCarContinuousVecEnv(**kw),
@@ -92,7 +95,7 @@ if _pointmass_spec is not None:
 if _pointmass_simple_spec is not None:
     IMPLEMENTED_ENVS["PointMassSimple-v0"] = _pointmass_simple_spec
 
-# Register DiffMountainCarContinuous 
+# Register DiffMountainCarContinuous
 if _diff_mountaincar_spec is not None:
     IMPLEMENTED_ENVS["DiffMountainCarContinuous-v0"] = _diff_mountaincar_spec
 

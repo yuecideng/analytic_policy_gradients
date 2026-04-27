@@ -618,12 +618,12 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
   \label{tab:sample_eff}
   \begin{tabular}{@{}lcrrr@{}}
     \toprule
-    \textbf{Environment} & \textbf{Threshold} & \textbf{PPO Steps} & \textbf{APG Steps} & \textbf{APG Speedup} \\
+    \textbf{Environment} & \textbf{Success Ratio} & \textbf{PPO Steps} & \textbf{APG Steps} & \textbf{APG Speedup} \\
     \midrule
     MountainCarContinuous & \tbd & \tbd & \tbd & \tbd \\
     PointMassNavigate & \tbd & \tbd & \tbd & \tbd \\
     PushT             & \tbd & \tbd & \tbd & \tbd \\
-    FrankaReach       & \tbd & \tbd & \tbd & \tbd \\
+    FrankaReach       & 20\% & 1000000 & 230400 & 4.34x \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -631,16 +631,16 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
 % ---- Table 3 ----
 \begin{table}[htbp]
   \centering
-  \caption{Compute efficiency: gradient steps to reach performance threshold.}
+  \caption{Learning efficiency: gradient steps to reach performance threshold.}
   \label{tab:grad_eff}
   \begin{tabular}{@{}lcrrr@{}}
     \toprule
-    \textbf{Environment} & \textbf{Threshold} & \textbf{PPO Grad Steps} & \textbf{APG Grad Steps} & \textbf{APG Speedup} \\
+    \textbf{Environment} & \textbf{Success Ratio} & \textbf{PPO Grad Steps} & \textbf{APG Grad Steps} & \textbf{APG Speedup} \\
     \midrule
     MountainCarContinuous & \tbd & \tbd & \tbd & \tbd \\
     PointMassNavigate & \tbd & \tbd & \tbd & \tbd \\
     PushT             & \tbd & \tbd & \tbd & \tbd \\
-    FrankaReach       & \tbd & \tbd & \tbd & \tbd \\
+    FrankaReach       & 20\% & 3824 & 240 & 15.9x \\
     \bottomrule
   \end{tabular}
 \end{table}

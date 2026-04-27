@@ -2,8 +2,9 @@ import torch
 import numpy as np
 import gymnasium as gym
 
+
 class PointMassSimpleEnv(gym.Env):
-    def __init__(self, num_envs=1, max_episode_steps=50, device='cpu', **kwargs):
+    def __init__(self, num_envs=1, max_episode_steps=50, device="cpu", **kwargs):
         """
         额外参数 (如 headless) 会被 kwargs 吸收，避免 TypeError。
         """
@@ -41,7 +42,7 @@ class PointMassSimpleEnv(gym.Env):
             torch.manual_seed(seed)
         else:
             super().reset()
-        
+
         # 随机初始化
         self.pos = (torch.rand(self.num_envs, device=self.device) - 0.5) * 2.0
         self.vel = (torch.rand(self.num_envs, device=self.device) - 0.5) * 0.5
@@ -59,7 +60,7 @@ class PointMassSimpleEnv(gym.Env):
         self.pos = self.pos + self.vel * self.dt
 
         error = self.pos - self.target
-        reward = -error ** 2
+        reward = -(error**2)
 
         self.step_count = self.step_count + 1
         truncated = self.step_count >= self.max_episode_steps
@@ -72,10 +73,7 @@ class PointMassSimpleEnv(gym.Env):
         for i in range(self.num_envs):
             if done[i]:
                 infos["final_info"][i] = {
-                    "episode": {
-                        "r": reward[i].item(),
-                        "l": self.step_count[i].item()
-                    }
+                    "episode": {"r": reward[i].item(), "l": self.step_count[i].item()}
                 }
         if done.any():
             self._auto_reset(done)
