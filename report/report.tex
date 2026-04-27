@@ -69,7 +69,7 @@
 
 % ==============================================================================
 \begin{abstract}
-Model-free reinforcement learning algorithms such as Proximal Policy Optimization (PPO) treat the environment as a black box, estimating policy gradients from sampled rewards—a process that demands millions of interactions and relies on high-variance advantage estimates. When environment dynamics are differentiable, the return is an end-to-end differentiable function of the policy parameters, enabling exact gradient computation via backpropagation through simulation. We term this approach Analytic Policy Gradients (APG) and evaluate it against PPO on three continuous control tasks of increasing dynamical complexity: a 2D point-mass navigation task with obstacle avoidance, a 2D rigid-body T-block pushing task, and a 7-DOF Franka FR3 end-effector reaching task. Both algorithms share identical model architectures, observation normalization, and optimizer settings. To decouple sample efficiency from compute efficiency, we design a multi-axis evaluation protocol that records performance against environment steps and gradient steps. We report a segmented backpropagation scheme with MC and critic-based bootstrap modes that mitigates gradient degradation on long-horizon tasks, and present ablations over segment length and bootstrap strategy.
+Model-free reinforcement learning algorithms such as Proximal Policy Optimization (PPO) treat the environment as a black box, estimating policy gradients from sampled rewards—a process that demands millions of interactions and relies on high-variance advantage estimates. When environment dynamics are differentiable, the return is an end-to-end differentiable function of the policy parameters, enabling exact gradient computation via backpropagation through simulation. We term this approach Analytic Policy Gradients (APG) and evaluate it against PPO on four continuous control tasks of increasing dynamical complexity: a hill-car momentum-accumulation task, a 2D point-mass navigation task with obstacle avoidance, a 2D rigid-body T-block pushing task, and a 7-DOF Franka FR3 end-effector reaching task. Both algorithms share identical model architectures, observation normalization, and optimizer settings. To decouple sample efficiency from compute efficiency, we design a multi-axis evaluation protocol that records performance against environment steps and gradient steps. We report a segmented backpropagation scheme with MC and critic-based bootstrap modes that mitigates gradient degradation on long-horizon tasks, and present ablations over segment length and bootstrap strategy.
 \end{abstract}
 
 % ==============================================================================
@@ -86,7 +86,7 @@ A largely underexploited opportunity is that many modern simulators are inherent
 \subsection{Paper Organization}
 \label{sec:organization}
 
-The remainder of this report is organized as follows. Section~\ref{sec:preliminaries} covers preliminaries on policy gradient methods and PPO. Section~\ref{sec:methodology} describes the APG methodology in detail. Section~\ref{sec:environments} presents the three benchmark environments. Section~\ref{sec:experiments} details the experimental setup and provides result templates. Section~\ref{sec:conclusion} discusses findings and concludes.
+The remainder of this report is organized as follows. Section~\ref{sec:preliminaries} covers preliminaries on policy gradient methods and PPO. Section~\ref{sec:methodology} describes the APG methodology in detail. Section~\ref{sec:environments} presents the four benchmark environments. Section~\ref{sec:experiments} details the experimental setup and provides result templates. Section~\ref{sec:conclusion} discusses findings and concludes.
 
 % ==============================================================================
 \section{Preliminaries}
@@ -240,7 +240,7 @@ The implementation supports two bootstrap modes:
 \label{sec:implementation}
 
 \paragraph{Differentiable dynamics via native PyTorch autograd.}
-For PointMassNavigate-v0 and PushT-v0, both of which are implemented entirely in PyTorch, APG differentiability is achieved without any special gradient bridge.
+For DiffMountainCarContinuous, PointMassNavigate and PushT, all of which are implemented entirely in PyTorch, APG differentiability is achieved without any special gradient bridge.
 The \texttt{*APGEnv} subclasses override \texttt{step()} to omit \texttt{torch.no\_grad()} and replace all in-place state updates with out-of-place assignments.
 Concretely, at each step the action is scaled to a force/torque, the damping-then-force Euler update is expressed as
 \[
@@ -274,9 +274,55 @@ All linear layers use orthogonal initialization with $\text{std} = \sqrt{2}$ (hi
 \section{Environments}
 \label{sec:environments}
 
-We evaluate on three continuous-control environments of increasing complexity, each implemented with both a black-box mode (PPO) and a differentiable mode (APG).
+We evaluate on four continuous-control environments of increasing complexity, each implemented with both a black-box mode (PPO) and a differentiable mode (APG).
 
-\subsection{PointMassNavigate-v0}
+\subsection{DiffMountainCarContinuous}
+\label{sec:env_mountaincar}
+
+\paragraph{Task:} Control a car in a one-dimensional valley and accumulate enough momentum to reach the goal on the right hill.
+
+\paragraph{State space} (2-dimensional): See Table~\ref{tab:mc_obs}.
+
+\begin{table}[htbp]
+  \centering
+  \caption{DiffMountainCarContinuous observation space.}
+  \label{tab:mc_obs}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    \textbf{Component} & \textbf{Dimensions} & \textbf{Description} \\
+    \midrule
+    Position & 1 & $x \in [-1.2, 0.6]$ \\
+    Velocity & 1 & $\dot{x} \in [-0.07, 0.07]$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Action space:} $\cA = [-1, 1]$ (scalar engine force).
+
+\paragraph{Reset distribution:} Initial position is sampled uniformly from $[-0.6, -0.4]$ and initial velocity is set to zero, matching the Gymnasium Continuous Mountain Car benchmark.
+
+\paragraph{Dynamics} (Gym-compatible hill-car update):
+\begin{align}
+  \dot{x}_{t+1} &\leftarrow \text{clip}\!\left(\dot{x}_t + 0.0015\,a_t - 0.0025 \cos(3x_t),\; [-0.07, 0.07]\right) \\
+  x_{t+1} &\leftarrow \text{clip}\!\left(x_t + \dot{x}_{t+1},\; [-1.2, 0.6]\right)
+\end{align}
+If the car hits the left boundary ($x_{t+1} = -1.2$) with negative velocity, we reset $\dot{x}_{t+1}$ to zero. The implementation is written entirely in PyTorch, so gradients flow directly through the transition map except at the clipping boundaries.
+
+\paragraph{Reward:} The differentiable implementation supports both the original Gym reward and a dense shaping used for APG experiments:
+\begin{align}
+  r_t^{\text{gym}} &= 100 \cdot \mathbf{1}[x_{t+1} \ge 0.45 \land \dot{x}_{t+1} \ge 0] - 0.1\,a_t^2 \\
+  r_t^{\text{smooth}} &= 2\,\tilde{x}_{t+1} + 4\,\sigma\!\left(\frac{x_{t+1} - 0.45}{0.02}\right) + 0.5 \frac{\dot{x}_{t+1}}{0.07} - 0.1\,a_t^2
+\end{align}
+where $\tilde{x}_{t+1} = \text{clip}\!\left(\frac{x_{t+1} + 1.2}{0.45 + 1.2},\, 0,\, 1.2\right)$ and $\sigma(\cdot)$ denotes the sigmoid function. Unless otherwise noted, APG uses the smooth reward because the original sparse success bonus provides little analytic signal away from the goal.
+
+\paragraph{Success condition:} $x \ge 0.45$ and $\dot{x} \ge 0$.
+
+\paragraph{Episode length:} 200 steps in the standalone environment implementation; in the unified training script the horizon can be overridden through \texttt{-{}-max\_episode\_steps}.
+
+\paragraph{APG gradient path:} $a_t \rightarrow \dot{x}_{t+1} \rightarrow x_{t+1} \rightarrow r_t$.
+
+
+\subsection{PointMassNavigate}
 \label{sec:env_pointmass}
 
 \paragraph{Task:} Navigate a point mass from a random start to a random goal position while avoiding two randomly-placed circular obstacles.
@@ -285,7 +331,7 @@ We evaluate on three continuous-control environments of increasing complexity, e
 
 \begin{table}[htbp]
   \centering
-  \caption{PointMassNavigate-v0 observation space.}
+  \caption{PointMassNavigate observation space.}
   \label{tab:pm_obs}
   \begin{tabular}{@{}lll@{}}
     \toprule
@@ -323,7 +369,7 @@ where $m = 1.0$\,kg, $c_d = 5.0$, $\bff = \ba \times 5.0$\,N.
 
 \paragraph{APG gradient path:} $\ba \rightarrow \bff \rightarrow \bvf \rightarrow \bpf \rightarrow r$ (fully differentiable Euler integration).
 
-\subsection{PushT-v0}
+\subsection{PushT}
 \label{sec:env_pusht}
 
 \paragraph{Task:} Push a T-shaped rigid block from a random initial pose to a random goal pose using external forces and torques.
@@ -332,7 +378,7 @@ where $m = 1.0$\,kg, $c_d = 5.0$, $\bff = \ba \times 5.0$\,N.
 
 \begin{table}[htbp]
   \centering
-  \caption{PushT-v0 observation space.}
+  \caption{PushT observation space.}
   \label{tab:pt_obs}
   \begin{tabular}{@{}lll@{}}
     \toprule
@@ -372,7 +418,7 @@ where $m = 0.1$\,kg, $I = 1.95 \times 10^{-4}$\,kg$\cdot$m$^2$, $c_d = 5.0$, $c_
 
 \paragraph{APG gradient path:} $\ba \rightarrow (\bff, \tau) \rightarrow (\bvf, \omega) \rightarrow (\bpf, \theta) \rightarrow r$.
 
-\subsection{FrankaReach-v0}
+\subsection{FrankaReach}
 \label{sec:env_franka}
 
 \paragraph{Task:} Control a 7-DOF Franka FR3 manipulator to reach a target 6D end-effector pose (position + orientation).
@@ -381,7 +427,7 @@ where $m = 0.1$\,kg, $I = 1.95 \times 10^{-4}$\,kg$\cdot$m$^2$, $c_d = 5.0$, $c_
 
 \begin{table}[htbp]
   \centering
-  \caption{FrankaReach-v0 observation space.}
+  \caption{FrankaReach observation space.}
   \label{tab:fr_obs}
   \begin{tabular}{@{}lll@{}}
     \toprule
@@ -420,24 +466,24 @@ The gradient computation uses a custom \texttt{torch.autograd.Function} that bri
 \subsection{Environment Complexity Comparison}
 \label{sec:env_comparison}
 
-Table~\ref{tab:env_comparison} compares the three environments across key properties.
+Table~\ref{tab:env_comparison} compares the four environments across key properties.
 
 \begin{table}[htbp]
   \centering
   \caption{Comparison of environment properties.}
   \label{tab:env_comparison}
-  \begin{tabular}{@{}llll@{}}
+  \begin{tabular}{@{}lllll@{}}
     \toprule
-    \textbf{Property} & \textbf{PointMass} & \textbf{PushT} & \textbf{FrankaReach} \\
+    \textbf{Property} & \textbf{MountainCar} & \textbf{PointMass} & \textbf{PushT} & \textbf{FrankaReach} \\
     \midrule
-    Observation dim        & 14                        & 9                          & 28 \\
-    Action dim             & 2                         & 3                          & 7 \\
-    Dynamics               & Point mass (Euler)        & 2D rigid body (Euler)      & Articulated body (FK) \\
-    DOF                    & 2 (pos)                   & 3 (pos + rot)              & 7 (joints) \\
-    Max episode steps      & 100                       & 100                        & 30 \\
-    Gradient bridge        & Native PyTorch            & Native PyTorch             & Warp $\leftrightarrow$ PyTorch \\
-    Obstacles/constraints  & 2 circles                 & Workspace bounds           & Joint limits \\
-    Orientation            & No                        & Yes ($\theta$)             & Yes (quaternion) \\
+    Observation dim        & 2                    & 14                        & 9                          & 28 \\
+    Action dim             & 1                    & 2                         & 3                          & 7 \\
+    Dynamics               & Hill-car (Euler)     & Point mass (Euler)        & 2D rigid body (Euler)      & Articulated body (FK) \\
+    DOF                    & 1 (pos)              & 2 (pos)                   & 3 (pos + rot)              & 7 (joints) \\
+    Max episode steps      & 200                  & 100                       & 100                        & 30 \\
+    Gradient bridge        & Native PyTorch       & Native PyTorch            & Native PyTorch             & Warp $\leftrightarrow$ PyTorch \\
+    Obstacles/constraints  & Valley walls         & 2 circles                 & Workspace bounds           & Joint limits \\
+    Orientation            & No                   & No                        & Yes ($\theta$)             & Yes (quaternion) \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -539,12 +585,12 @@ We employ a rigorous evaluation protocol to ensure fair comparison:
 \subsection{Experiment Results}
 \label{sec:results}
 
-Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std over 5 seeds) for all three environments, plotted against total gradient steps to enable a fair compute-controlled comparison between PPO and APG. Table~\ref{tab:final_return} summarises the final returns.
+Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std over 5 seeds) for all four environments, plotted against total gradient steps to enable a fair compute-controlled comparison between PPO and APG. Table~\ref{tab:final_return} summarises the final returns.
 
 \begin{figure}[htbp]
   \centering
   \includegraphics[width=\textwidth]{../figures/return_curves}
-  \caption{Episodic return (mean $\pm$ std, 5 seeds) vs.\ total gradient steps for PPO (blue) and APG (orange) across three environments. The x-axis is equalized: both algorithms execute the same total number of gradient updates.}
+  \caption{Episodic return (mean $\pm$ std, 5 seeds) vs.\ total gradient steps for PPO (blue) and APG (orange) across four environments. The x-axis is equalized: both algorithms execute the same total number of gradient updates.}
   \label{fig:return_curves}
 \end{figure}
 
@@ -557,9 +603,10 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
     \toprule
     \textbf{Environment} & \textbf{PPO (mean $\pm$ std)} & \textbf{APG (mean $\pm$ std)} \\
     \midrule
-    PointMassNavigate-v0 & $-64.89 \pm 11.92$ & $-5.25 \pm 3.36$ \\
-    PushT-v0             & $-2.47 \pm 4.69$   & $-0.64 \pm 0.28$ \\
-    FrankaReach-v0       & $0.02 \pm 0.25$    & $0.92 \pm 0.33$ \\
+    MountainCarContinuous & \tbd & \tbd \\
+    PointMassNavigate & $-64.89 \pm 11.92$ & $-5.25 \pm 3.36$ \\
+    PushT             & $-2.47 \pm 4.69$   & $-0.64 \pm 0.28$ \\
+    FrankaReach       & $0.02 \pm 0.25$    & $0.92 \pm 0.33$ \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -573,9 +620,10 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
     \toprule
     \textbf{Environment} & \textbf{Threshold} & \textbf{PPO Steps} & \textbf{APG Steps} & \textbf{APG Speedup} \\
     \midrule
-    PointMassNavigate-v0 & \tbd & \tbd & \tbd & \tbd \\
-    PushT-v0             & \tbd & \tbd & \tbd & \tbd \\
-    FrankaReach-v0       & \tbd & \tbd & \tbd & \tbd \\
+    MountainCarContinuous & \tbd & \tbd & \tbd & \tbd \\
+    PointMassNavigate & \tbd & \tbd & \tbd & \tbd \\
+    PushT             & \tbd & \tbd & \tbd & \tbd \\
+    FrankaReach       & \tbd & \tbd & \tbd & \tbd \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -589,9 +637,10 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
     \toprule
     \textbf{Environment} & \textbf{Threshold} & \textbf{PPO Grad Steps} & \textbf{APG Grad Steps} & \textbf{APG Speedup} \\
     \midrule
-    PointMassNavigate-v0 & \tbd & \tbd & \tbd & \tbd \\
-    PushT-v0             & \tbd & \tbd & \tbd & \tbd \\
-    FrankaReach-v0       & \tbd & \tbd & \tbd & \tbd \\
+    MountainCarContinuous & \tbd & \tbd & \tbd & \tbd \\
+    PointMassNavigate & \tbd & \tbd & \tbd & \tbd \\
+    PushT             & \tbd & \tbd & \tbd & \tbd \\
+    FrankaReach       & \tbd & \tbd & \tbd & \tbd \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -601,15 +650,15 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
   \centering
   \caption{Ablation study: effect of APG segment length and bootstrap mode on episodic return.}
   \label{tab:ablation_seg}
-  \begin{tabular}{@{}clccc@{}}
+  \begin{tabular}{@{}clcccc@{}}
     \toprule
-    \textbf{Segment Length} & \textbf{Bootstrap} & \textbf{PointMass} & \textbf{PushT} & \textbf{FrankaReach} \\
+    \textbf{Segment Length} & \textbf{Bootstrap} & \textbf{MountainCar} & \textbf{PointMass} & \textbf{PushT} & \textbf{FrankaReach} \\
     \midrule
-    Full episode & ---    & $-5.25 \pm 3.36$ & $-0.64 \pm 0.28$ & N/A \\
-    10           & MC     & $-4.23 \pm 1.80$ & $-0.25 \pm 0.50$ & N/A \\
-    10           & Critic & $-4.23 \pm 1.80$ & $-0.25 \pm 0.50$ & N/A \\
-    5            & MC     & $-4.08 \pm 0.60$ & $-0.41 \pm 0.05$ & N/A \\
-    5            & Critic & $-4.08 \pm 0.60$ & $-0.41 \pm 0.05$ & N/A \\
+    Full episode & ---    & \tbd & $-5.25 \pm 3.36$ & $-0.64 \pm 0.28$ & N/A \\
+    10           & MC     & \tbd & $-4.23 \pm 1.80$ & $-0.25 \pm 0.50$ & N/A \\
+    10           & Critic & \tbd & $-4.23 \pm 1.80$ & $-0.25 \pm 0.50$ & N/A \\
+    5            & MC     & \tbd & $-4.08 \pm 0.60$ & $-0.41 \pm 0.05$ & N/A \\
+    5            & Critic & \tbd & $-4.08 \pm 0.60$ & $-0.41 \pm 0.05$ & N/A \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -621,7 +670,7 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
 \subsection{Summary}
 \label{sec:summary}
 
-We presented a unified framework for comparing Analytic Policy Gradients (APG) and Proximal Policy Optimization (PPO) across three differentiable continuous control environments. The design of the framework surfaces four key research questions whose empirical answers are deferred pending completed experiments:
+We presented a unified framework for comparing Analytic Policy Gradients (APG) and Proximal Policy Optimization (PPO) across four differentiable continuous control environments. The design of the framework surfaces four key research questions whose empirical answers are deferred pending completed experiments:
 
 % Fill in concrete findings after experiments
 
@@ -630,7 +679,7 @@ We presented a unified framework for comparing Analytic Policy Gradients (APG) a
 
   \item \textbf{Sample efficiency trade-off:} PPO performs 4 update epochs over 4 minibatches per rollout (16 gradient steps per environment interaction). APG uses one gradient step per rollout. The per-sample quality of APG gradients must compensate for this asymmetry to achieve competitive wall-clock performance.
 
-  \item \textbf{Scalability with dynamics complexity:} APG's advantage is expected to be most pronounced in smooth, low-dimensional environments (PointMassNavigate) and may diminish in high-DOF articulated-body settings (FrankaReach) where long gradient chains through forward kinematics can introduce instability.
+  \item \textbf{Scalability with dynamics complexity:} APG's advantage is expected to be most pronounced in smooth, low-dimensional environments (DiffMountainCarContinuous, PointMassNavigate) and may diminish in high-DOF articulated-body settings (FrankaReach) where long gradient chains through forward kinematics can introduce instability.
 
   \item \textbf{Gradient bridge feasibility:} Our custom \texttt{torch.autograd.Function} demonstrates that analytic policy gradients are practical for GPU-accelerated physics engines that do not natively expose PyTorch-compatible derivatives, broadening APG beyond analytically specified environments.
 \end{enumerate}
@@ -748,7 +797,7 @@ We presented a unified framework for comparing Analytic Policy Gradients (APG) a
 \section{Training Curves}
 \label{sec:appendix_curves}
 
-See Figure~\ref{fig:return_curves} in Section~\ref{sec:results} for the return curves (mean $\pm$ std, 5 seeds) plotted against total gradient steps.
+See Figure~\ref{fig:return_curves} in Section~\ref{sec:results} for the return curves (mean $\pm$ std, 5 seeds) plotted against total gradient steps for all four environments.
 
 \section{Environment Visualizations}
 \label{sec:appendix_vis}
