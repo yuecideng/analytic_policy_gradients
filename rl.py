@@ -123,7 +123,7 @@ class Args:
     # Comparison
     max_episode_steps: int = 30
     """max episode steps for custom environments"""
-    equalize_grad_steps: bool = False
+    equalize_grad_steps: bool = True
     """scale APG iterations so total gradient steps match PPO"""
 
     # Seed sweep & evaluation
