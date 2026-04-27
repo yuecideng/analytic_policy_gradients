@@ -507,8 +507,18 @@ class PointMassAPGEnv(PointMassVecEnv):
         # Clamp — differentiable (clamp has well-defined grad)
         self.pos = self.pos.clamp(-WORKSPACE_HALF, WORKSPACE_HALF)
 
-        # Observation (detached — policy doesn't need grad through obs)
-        obs = self._get_obs()
+        # Observation: keep in graph so V(obs_end) can extend gradient horizon to actor
+        obs = torch.cat(
+            [
+                self.pos,
+                self.vel,
+                self.goal_pos,
+                self.last_action.detach(),  # last_action is already detached constant
+                self.obstacle_pos,
+                self.obstacle_radii,
+            ],
+            dim=-1,
+        )
 
         # Reward (preserves grad through pos, vel, action)
         reward = _compute_reward(

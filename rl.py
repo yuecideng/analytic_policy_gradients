@@ -258,7 +258,6 @@ def deterministic_eval(
     completed_lengths = []
     completed_successes = []
     completed_final_dists = []
-    from IPython import embed; embed()
     obs, _ = eval_envs.reset()
     obs = obs.to(device)
     ep_ret = torch.zeros(eval_envs.num_envs, dtype=torch.float32, device=device)
@@ -558,7 +557,6 @@ def _run_training(args, seed):
         use_critic = (
             effective_seg < args.max_episode_steps and args.apg_bootstrap == "critic"
         )
-
         if use_critic:
             critic_lr = (
                 args.apg_critic_lr
@@ -999,7 +997,7 @@ def _run_training(args, seed):
                         current_ep_len[done_mask] = 0.0
 
                     seg_rewards_all.append(segment_rewards)
-                    seg_norm_obs_end.append(obs_normalizer.normalize(obs.detach()))
+                    seg_norm_obs_end.append(obs_normalizer.normalize(obs))
 
                     # Detach at segment boundary — limits gradient chain to seg_steps
                     obs = obs.detach()
@@ -1049,13 +1047,11 @@ def _run_training(args, seed):
                     is_last = seg_idx == num_segments - 1
                     if not is_last and use_seg:
                         if args.apg_bootstrap == "mc":
-                            bootstrap_value = mc_future[seg_idx]
+                            bootstrap_value = (args.gamma**seg_steps) * mc_future[seg_idx]
                         elif args.apg_bootstrap == "critic":
                             bootstrap_value = (
                                 args.gamma**seg_steps
-                            ) * agent.get_value(seg_norm_obs_end[seg_idx]).squeeze(
-                                -1
-                            ).detach()
+                            ) * agent.get_value(seg_norm_obs_end[seg_idx]).squeeze(-1)
                         else:
                             bootstrap_value = torch.zeros(args.num_envs, device=device)
                     else:
@@ -1065,10 +1061,9 @@ def _run_training(args, seed):
 
                     # Collect critic training data
                     if use_seg and args.apg_bootstrap == "critic":
-                        with torch.no_grad():
-                            critic_pred = agent.get_value(
-                                seg_norm_obs_start[seg_idx]
-                            ).squeeze(-1)
+                        critic_pred = agent.get_value(
+                            seg_norm_obs_start[seg_idx]
+                        ).squeeze(-1)
                         critic_values_list.append(critic_pred)
                         critic_targets_list.append(
                             (seg_return + bootstrap_value).detach()
@@ -1200,7 +1195,6 @@ def _run_training(args, seed):
             print(f"  AUC (success rate): {auc:.6f}")
 
     print(
-        f"  Total optimization steps: {total_optim_steps} "
         f"(global_step={global_step})"
     )
 

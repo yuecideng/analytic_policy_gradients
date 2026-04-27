@@ -219,3 +219,5 @@ wandb/
 *.toc
 *.synctex.gz
 *.out 
+
+slides/*

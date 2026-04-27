@@ -249,7 +249,7 @@ Concretely, at each step the action is scaled to a force/torque, the damping-the
 \]
 where every multiplication and addition is a new tensor with a live \texttt{grad\_fn}.
 The reward is then computed from these live tensors, so a single \texttt{loss.backward()} propagates gradients through the entire chain $\ba \to (\mathbf{f}, \tau) \to (\mathbf{v}, \omega) \to (\mathbf{p}, \theta) \to r$.
-The observation returned to the policy is \emph{detached}, as the policy does not need gradients with respect to its own previous outputs; similarly, \texttt{last\_action} is stored detached so it acts as a constant penalty baseline for the action-rate term.
+The observation returned to the policy at each step is constructed from the live \texttt{self.pos} and \texttt{self.vel} tensors (which carry \texttt{grad\_fn}) rather than from detached copies. This is essential for critic bootstrapping in the segmented setting: the value $V_\phi(s_{k,\text{end}})$ computed at the end of segment $k$ can then propagate gradients back through the terminal observation to the policy parameters, effectively extending the gradient horizon past the segment boundary. Only \texttt{last\_action} is stored detached, as it serves as a constant penalty baseline for the action-rate reward term.
 At segment boundaries, \texttt{detach\_state()} replaces every state tensor with its detached clone, preventing gradient chains from accumulating across segments and causing ``backward through the graph a second time'' errors.
 
 \paragraph{Gradient bridge for physics simulation.}
@@ -631,7 +631,7 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
   \label{tab:sample_eff}
   \begin{tabular}{@{}lcrrr@{}}
     \toprule
-    \textbf{Environment} & \textbf{Success Ratio} & \textbf{PPO Steps} & \textbf{APG Steps} & \textbf{APG Speedup} \\
+    \textbf{Environment} & \textbf{Success Ratio} & \textbf{PPO Steps} & \textbf{APG Steps} & \textbf{APG Reduction} \\
     \midrule
     MountainCarContinuous & \tbd & \tbd & \tbd & \tbd \\
     PointMassNavigate & 20\% & 263360 & 192000 & 1.37x \\
@@ -658,23 +658,82 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
   \end{tabular}
 \end{table}
 
+\subsection{Ablation: Bootstrap Mode for Segmented APG}
+\label{sec:ablation_bootstrap}
+
+We conduct an ablation study on PointMassNavigate to isolate the effect of the bootstrap strategy in segmented APG (segment length $L=25$, horizon $T=100$, giving 4 segments per episode). Two modes are compared across 3 seeds each:
+
+\begin{itemize}
+  \item \textbf{MC bootstrap}: future returns for each segment are pre-computed by backward accumulation of detached rewards from all subsequent segments, properly discounted by $\gamma^{L_k}$ at each segment boundary.
+  \item \textbf{Critic bootstrap}: a learned value function $V_\phi(s)$ estimates the discounted future return at each segment boundary ($b_k = \gamma^{L_k} V_\phi(s_{k,\text{end}})$). The critic is trained concurrently via MSE regression to segment-level bootstrapped returns. Crucially, $s_{k,\text{end}}$ is kept in the computation graph (not detached), so $\nabla_{\btheta} b_k$ extends the effective gradient horizon through the critic to the terminal state of each segment.
+\end{itemize}
+
+Figure~\ref{fig:ablation_bootstrap} shows the learning curves. Both modes reach a success rate of $1.0$ by the end of training. The critic bootstrap converges to a slightly higher final episodic return ($-14.44 \pm 3.38$) than MC bootstrap ($-15.31 \pm 2.84$), though the difference is within one standard deviation given three seeds. The critic bootstrap exhibits marginally faster early-phase improvement, consistent with the expected benefit of a learned value function reducing variance in the return estimate at segment boundaries.
+
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/ablation_bootstrap_return}
+    \caption{Episodic return (mean $\pm$ std, 3 seeds).}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/ablation_bootstrap_success}
+    \caption{Success rate (mean $\pm$ std, 3 seeds).}
+  \end{subfigure}
+  \caption{Bootstrap mode ablation on PointMassNavigate with segment length $L=25$. Blue: MC bootstrap; orange: critic bootstrap. Both modes use the same APG training loop; the only difference is how the segment boundary value $b_k$ is estimated.}
+  \label{fig:ablation_bootstrap}
+\end{figure}
+
 % ---- Table 4 ----
+
+\subsection{Ablation: Segment Length with MC and Critic Bootstrap}
+\label{sec:ablation_segment}
+
+To understand how segment length $L$ interacts with the bootstrap strategy, we sweep $L \in \{10, 25, 50\}$ under both MC and critic bootstrap on PointMassNavigate (horizon $T=100$, one seed per condition). This isolates the credit-assignment range—shorter segments truncate gradient chains more aggressively, relying more heavily on the bootstrap estimate to carry future-return information across boundaries.
+
+Figure~\ref{fig:ablation_segment} and Table~\ref{tab:ablation_segment} summarize the results.
+
+\textbf{MC bootstrap} is robust across all three segment lengths. Even at $L=10$ (10 segments per episode) it achieves a success rate of 0.9 and converges to a reasonable final return of $-22.3$. Performance improves monotonically with $L$: at $L=25$ and $L=50$ the agent reaches a success rate of 1.0, with final returns of $-15.1$ and $-10.5$ respectively. The consistent gradient signal from pre-computed discounted returns makes MC bootstrap tolerant of shorter horizons.
+
+\textbf{Critic bootstrap} exhibits a strong sensitivity to $L$. At $L=10$, the critic fails to provide reliable bootstrap targets early in training, and the agent converges to a degenerate policy with zero success rate and a return of $-61.7$. At $L=25$ the critic partially recovers (success rate 0.5, return $-34.5$), and at $L=50$ it matches MC bootstrap ($-9.8$, success 1.0). The critic's value estimates require a sufficient gradient horizon to stabilize: when segments are too short, the critic's bootstrapped targets are too noisy to extend effective credit assignment beyond the segment boundary, and the additional critic loss introduces conflicting gradients.
+
+The results suggest that MC bootstrap should be preferred as the default for short-to-medium segment lengths, while critic bootstrap becomes competitive only when $L$ is large enough to supply stable training signal to the value network.
+
+% ---- Table: segment length ablation summary ----
 \begin{table}[htbp]
   \centering
-  \caption{Ablation study: effect of APG segment length and bootstrap mode on episodic return.}
-  \label{tab:ablation_seg}
-  \begin{tabular}{@{}clcccc@{}}
+  \caption{Segment length ablation: final episodic return and success rate on PointMassNavigate (1 seed per condition, 500K steps).}
+  \label{tab:ablation_segment}
+  \begin{tabular}{@{}llrr@{}}
     \toprule
-    \textbf{Segment Length} & \textbf{Bootstrap} & \textbf{MountainCar} & \textbf{PointMass} & \textbf{PushT} & \textbf{FrankaReach} \\
+    \textbf{Bootstrap} & \textbf{$L$} & \textbf{Final Return} & \textbf{Success Rate} \\
     \midrule
-    Full episode & ---    & \tbd & $-5.25 \pm 3.36$ & $-0.64 \pm 0.28$ & N/A \\
-    10           & MC     & \tbd & $-4.23 \pm 1.80$ & $-0.25 \pm 0.50$ & N/A \\
-    10           & Critic & \tbd & $-4.23 \pm 1.80$ & $-0.25 \pm 0.50$ & N/A \\
-    5            & MC     & \tbd & $-4.08 \pm 0.60$ & $-0.41 \pm 0.05$ & N/A \\
-    5            & Critic & \tbd & $-4.08 \pm 0.60$ & $-0.41 \pm 0.05$ & N/A \\
+    MC     & 10 & $-22.3$ & 0.90 \\
+    MC     & 25 & $-15.1$ & 1.00 \\
+    MC     & 50 & $-10.5$ & 1.00 \\
+    \midrule
+    Critic & 10 & $-61.7$ & 0.00 \\
+    Critic & 25 & $-34.5$ & 0.50 \\
+    Critic & 50 & $-9.8$  & 1.00 \\
     \bottomrule
   \end{tabular}
 \end{table}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/ablation_segment_return}
+    \caption{Episodic return vs.\ global steps.}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/ablation_segment_success}
+    \caption{Success rate vs.\ global steps.}
+  \end{subfigure}
+  \caption{Segment length ablation on PointMassNavigate. Each panel shows one bootstrap mode (MC left, Critic right); line styles encode $L \in \{10, 25, 50\}$ (solid, dashed, dotted). MC bootstrap degrades gracefully as $L$ shrinks; critic bootstrap collapses at $L=10$ and recovers only at $L=50$.}
+  \label{fig:ablation_segment}
+\end{figure}
 
 % ==============================================================================
 \section{Discussion and Conclusion}
@@ -683,16 +742,14 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
 \subsection{Summary}
 \label{sec:summary}
 
-We presented a unified framework for comparing Analytic Policy Gradients (APG) and Proximal Policy Optimization (PPO) across four differentiable continuous control environments. The design of the framework surfaces four key research questions whose empirical answers are deferred pending completed experiments:
-
-% Fill in concrete findings after experiments
+We presented a unified framework for comparing Analytic Policy Gradients (APG) and Proximal Policy Optimization (PPO) across four differentiable continuous control environments. Experiments on PointMassNavigate, PushT, and FrankaReach yield four concrete findings:
 
 \begin{enumerate}
-  \item \textbf{Gradient quality vs.\ variance:} APG computes exact policy gradients by backpropagating through dynamics, bypassing the variance inherent in Monte Carlo advantage estimation. Whether this translates to faster or more stable policy improvement depends on the conditioning of the gradient chain.
+  \item \textbf{Gradient quality vs.\ variance:} APG computes exact policy gradients by backpropagating through dynamics, bypassing the variance inherent in Monte Carlo advantage estimation. Across all three tested environments APG converges to a success rate of 1.0, confirming that exact gradients provide a reliable training signal.
 
-  \item \textbf{Sample efficiency trade-off:} PPO performs 4 update epochs over 4 minibatches per rollout (16 gradient steps per environment interaction). APG uses one gradient step per rollout. The per-sample quality of APG gradients must compensate for this asymmetry to achieve competitive wall-clock performance.
+  \item \textbf{Sample efficiency:} APG requires substantially fewer gradient steps than PPO to reach comparable performance thresholds (Table~\ref{tab:grad_eff}): 9.2$\times$ fewer on PointMassNavigate, 3.9$\times$ on PushT, and 15.9$\times$ on FrankaReach, demonstrating that the per-step quality of analytic gradients more than compensates for PPO's multi-epoch update schedule.
 
-  \item \textbf{Scalability with dynamics complexity:} APG's advantage is expected to be most pronounced in smooth, low-dimensional environments (DiffMountainCarContinuous, PointMassNavigate) and may diminish in high-DOF articulated-body settings (FrankaReach) where long gradient chains through forward kinematics can introduce instability.
+  \item \textbf{Segmentation and bootstrap strategy matter:} The segment length ablation (Section~\ref{sec:ablation_segment}) shows that MC bootstrap degrades gracefully as $L$ shrinks (success rate 0.9 at $L=10$), while critic bootstrap collapses entirely at $L=10$ (success rate 0.0) and recovers only at $L=50$. MC bootstrap is therefore the more robust default for short-to-medium horizons; critic bootstrap offers competitive final performance only when the segment length is large enough to stabilize its value targets.
 
   \item \textbf{Gradient bridge feasibility:} Our custom \texttt{torch.autograd.Function} demonstrates that analytic policy gradients are practical for GPU-accelerated physics engines that do not natively expose PyTorch-compatible derivatives, broadening APG beyond analytically specified environments.
 \end{enumerate}
@@ -720,7 +777,7 @@ We presented a unified framework for comparing Analytic Policy Gradients (APG) a
   The differentiability requirement currently restricts APG to analytically specified simulators. A natural generalization is to treat learned neural world models as the differentiable substrate, backpropagating policy gradients through model-predicted rollouts rather than ground-truth dynamics. Recent model-based RL systems such as DreamerV3~\cite{hafner2023dreamerv3} and TD-MPC2~\cite{hansen2024tdmpc2} demonstrate that latent imagination with differentiable recurrent transitions enables competitive policy optimization without environment rollouts. However, gradient compounding through approximate models introduces model-bias error that can dominate the variance reduction benefit. A systematic study comparing APG gradient quality under ground-truth versus learned dynamics---as a function of model capacity, rollout horizon, and Lipschitz constant---would clarify when learned-model gradients remain reliable signals and when model errors corrupt the optimization landscape.
 
   \item \textbf{Principled adaptive segment-length scheduling.}
-  Our ablation (Table~\ref{tab:ablation_seg}) reveals that shorter segment lengths reduce episodic return variance at the cost of truncated credit assignment. A theoretically principled curriculum could adapt the segment length $L_{\mathrm{seg}}$ online based on the gradient signal-to-noise ratio~\cite{pascanu2013exploding} or the convergence of the critic's bootstrap targets. Formally, the optimal segment length balances the bias introduced by truncated BPTT against gradient variance, an objective analogous to the $\lambda$ selection problem in GAE. Adaptive schedules grounded in this bias--variance decomposition, potentially implemented via meta-gradient methods that differentiate through the segment-length choice, would provide a more robust alternative to the fixed-length ablation studied here.
+  Our segment length ablation (Section~\ref{sec:ablation_segment}, Table~\ref{tab:ablation_segment}) reveals a clear bias--variance trade-off: shorter segments reduce memory overhead and gradient chain length but truncate credit assignment, and the impact is particularly severe for critic bootstrap. A theoretically principled curriculum could adapt $L_{\mathrm{seg}}$ online based on the gradient signal-to-noise ratio~\cite{pascanu2013exploding} or the convergence of the critic's bootstrap targets. The optimal segment length balances the bias introduced by truncated BPTT against gradient variance, an objective analogous to the $\lambda$ selection problem in GAE. Adaptive schedules grounded in this bias--variance decomposition, potentially implemented via meta-gradient methods that differentiate through the segment-length choice, would provide a more robust alternative to the fixed-length ablation studied here.
 
 \end{enumerate}
 
