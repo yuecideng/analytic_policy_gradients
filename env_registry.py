@@ -54,6 +54,16 @@ except ImportError:
     _pointmass_spec = None
 
 try:
+    from point_mass_simple_env import PointMassSimpleEnv
+
+    _pointmass_simple_spec = EnvSpec(
+        ppo_factory=lambda **kw: PointMassSimpleEnv(**kw),
+        apg_factory=lambda **kw: PointMassSimpleEnv(**kw),
+    )
+except ImportError:
+    _pointmass_simple_spec = None
+
+try:
     from mountaincar_continuous_diff_env import MountainCarContinuousAPGEnv,MountainCarContinuousVecEnv
 
     _diff_mountaincar_spec = EnvSpec(
@@ -77,6 +87,10 @@ if _pusht_spec is not None:
 # Register PointMassNavigate (pure PyTorch, no heavy deps — always available).
 if _pointmass_spec is not None:
     IMPLEMENTED_ENVS["PointMassNavigate-v0"] = _pointmass_spec
+
+# Register simple 1D PointMass target-reaching env.
+if _pointmass_simple_spec is not None:
+    IMPLEMENTED_ENVS["PointMassSimple-v0"] = _pointmass_simple_spec
 
 # Register DiffMountainCarContinuous 
 if _diff_mountaincar_spec is not None:
