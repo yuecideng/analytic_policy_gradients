@@ -69,7 +69,7 @@
 
 % ==============================================================================
 \begin{abstract}
-Model-free reinforcement learning algorithms such as Proximal Policy Optimization (PPO) treat the environment as a black box, estimating policy gradients from sampled rewards—a process that demands millions of interactions and relies on high-variance advantage estimates. When environment dynamics are differentiable, the return is an end-to-end differentiable function of the policy parameters, enabling exact gradient computation via backpropagation through simulation. We term this approach Analytic Policy Gradients (APG) and evaluate it against PPO on four continuous control tasks of increasing dynamical complexity: a hill-car momentum-accumulation task, a 2D point-mass navigation task with obstacle avoidance, a 2D rigid-body T-block pushing task, and a 7-DOF Franka FR3 end-effector reaching task. Both algorithms share identical model architectures, observation normalization, and optimizer settings. To decouple sample efficiency from compute efficiency, we design a multi-axis evaluation protocol that records performance against environment steps and gradient steps. We report a segmented backpropagation scheme with MC and critic-based bootstrap modes that mitigates gradient degradation on long-horizon tasks, and present ablations over segment length and bootstrap strategy.
+Model-free reinforcement learning algorithms such as Proximal Policy Optimization (PPO) treat the environment as a black box, estimating policy gradients from sampled rewards—a process that demands millions of interactions and relies on high-variance advantage estimates. When environment dynamics are differentiable, the return is an end-to-end differentiable function of the policy parameters, enabling exact gradient computation via backpropagation through simulation. We term this approach Analytic Policy Gradients (APG) and evaluate it against PPO on four continuous control tasks of increasing dynamical complexity: a one-dimensional point-mass target-reaching task, a 2D point-mass navigation task with obstacle avoidance, a 2D rigid-body T-block pushing task, and a 7-DOF Franka FR3 end-effector reaching task. Both algorithms share identical model architectures, observation normalization, and optimizer settings. To decouple sample efficiency from compute efficiency, we design a multi-axis evaluation protocol that records performance against environment steps and gradient steps. We report a segmented backpropagation scheme with MC and critic-based bootstrap modes that mitigates gradient degradation on long-horizon tasks, and present ablations over segment length and bootstrap strategy.
 \end{abstract}
 
 % ==============================================================================
@@ -95,10 +95,16 @@ The remainder of this report is organized as follows. Section~\ref{sec:prelimina
 \subsection{Markov Decision Processes}
 \label{sec:mdp}
 
-We model the RL problem as a Markov Decision Process (MDP) defined by the tuple $(\cS, \cA, T, R, \gamma)$, where $\cS$ is the state space, $\cA$ is the action space, $T(s' \mid s, a)$ is the transition dynamics, $R(s, a)$ is the reward function, and $\gamma \in [0, 1)$ is the discount factor. A policy $\pi_{\btheta}(a \mid s)$ parameterized by $\btheta$ maps states to action distributions. The objective is to maximize the expected discounted return:
+We model the RL problem as a Markov Decision Process (MDP) defined by the tuple $(\cS, \cA, P, R, \gamma)$, where $\cS$ is the state space, $\cA$ is the action space, $P(s' \mid s, a)$ is the stochastic transition kernel, $R(s, a)$ is the reward function, and $\gamma \in [0, 1)$ is the discount factor. A policy $\pi_{\btheta}(a \mid s)$ parameterized by $\btheta$ maps states to action distributions. The objective is to maximize the infinite-horizon discounted return:
 \begin{equation}
-  J(\btheta) = \E_{\pi_{\btheta}}\left[\sum_{t=0}^{T} \gamma^t R(s_t, a_t)\right]
+  J(\btheta) = \E_{\pi_{\btheta}}\left[\sum_{t=0}^{\infty} \gamma^t R(s_t, a_t)\right]
   \label{eq:objective}
+\end{equation}
+
+In practice, training and evaluation use a finite horizon $H$. By the value truncation lemma, the infinite sum can be approximated by the truncated episode return:
+\begin{equation}
+  J_H(\btheta) = \E_{\pi_{\btheta}}\left[\sum_{t=0}^{H} \gamma^t R(s_t, a_t)\right].
+  \label{eq:truncated_objective}
 \end{equation}
 
 \subsection{Proximal Policy Optimization (PPO)}
@@ -124,31 +130,36 @@ PPO treats the environment as a \textbf{black box}: it collects trajectories usi
 \subsection{Analytic Policy Gradients}
 \label{sec:apg_concept}
 
-In contrast to black-box methods, APG exploits the differentiability of the environment dynamics $T$ and reward function $R$. For a stochastic policy with reparameterized sampling $a_t = f_{\btheta}(s_t) + \bsigma_{\btheta} \odot \bepsilon_t$, $\bepsilon_t \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$, and deterministic transition $s_{t+1} = T(s_t, a_t)$, the return is a differentiable function of $\btheta$ through the reparameterization:
+In contrast to black-box methods, APG assumes that the general stochastic transition kernel $P(s' \mid s, a)$ is replaced by a deterministic differentiable transition map $T(s, a)$. Together with a differentiable reward $R_\theta$, this makes the rollout itself a differentiable computation graph. For a stochastic policy with reparameterized sampling $a_t = \mu_{\theta}(s_t) + \sigma_{\theta} \odot \epsilon_t$, $\epsilon_t \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$, and deterministic transition $s_{t+1} = T(s_t, a_t)$, the finite-horizon return is directly differentiable with respect to $\theta$:
 \begin{equation}
-  J(\btheta) = \sum_{t=0}^{H} \gamma^t R(s_t, a_t), \quad s_{t+1} = T(s_t, a_t), \quad a_t = f_{\btheta}(s_t)
+  J(\theta) = \sum_{t=0}^{H} \gamma^t R_{\theta}(s_t, a_t), \quad
+  s_{t+1} = T(s_t, a_t), \quad
+  a_t = \mu_{\theta}(s_t) + \sigma_{\theta} \odot \epsilon_t .
   \label{eq:apg_return}
 \end{equation}
 
-The gradient $\nabla_{\btheta} J(\btheta)$ is obtained by applying the total derivative through the entire trajectory:
+The gradient $\nabla_{\theta} J(\theta)$ is obtained by applying the total derivative through the entire trajectory:
 \begin{equation}
-  \nabla_{\btheta} J(\btheta) = \sum_{t=0}^{H} \gamma^t \frac{d R_t}{d \btheta}
+  \nabla_{\theta} J(\theta) = \sum_{t=0}^{H} \gamma^t \frac{\partial R_{\theta}(s_t, a_t)}{\partial \theta}
   \label{eq:apg_grad}
 \end{equation}
 
-where the total derivative $\tfrac{d R_t}{d \btheta}$ expands via the chain rule as:
+where the total derivative of $R_{\theta}$ expands via the chain rule as:
 \begin{equation}
-  \frac{d R_t}{d \btheta}
-  = \frac{\partial R_t}{\partial a_t}\frac{\partial a_t}{\partial \btheta}
-  + \frac{\partial R_t}{\partial s_t}\frac{d s_t}{d \btheta}
+  \frac{\partial R_{\theta}}{\partial \theta}
+  =
+  \frac{\partial R_{\theta}}{\partial a_t}\frac{\partial a_t}{\partial \theta}
+  + \frac{\partial R_{\theta}}{\partial s_t}\frac{\partial s_t}{\partial \theta}
   \label{eq:apg_chain}
 \end{equation}
 
-The state gradient $\tfrac{d s_t}{d \btheta}$ satisfies the recursion:
+The state gradient $\tfrac{\partial s_t}{\partial \theta}$ satisfies the recursion:
 \begin{equation}
-  \frac{d s_t}{d \btheta}
-  = \frac{\partial T}{\partial a_{t-1}}\frac{\partial a_{t-1}}{\partial \btheta}
-  + \frac{\partial T}{\partial s_{t-1}}\frac{d s_{t-1}}{d \btheta}, \qquad \frac{d s_0}{d \btheta} = \mathbf{0}
+  \frac{\partial s_t}{\partial \theta}
+  =
+  \frac{\partial T}{\partial a_{t-1}}\frac{\partial a_{t-1}}{\partial \theta}
+  + \frac{\partial T}{\partial s_{t-1}}\frac{\partial s_{t-1}}{\partial \theta}, \qquad
+  \frac{\partial s_0}{\partial \theta} = \mathbf{0}
   \label{eq:apg_state_grad}
 \end{equation}
 
@@ -187,20 +198,20 @@ The APG training loop follows a \textbf{stateful rollout} paradigm: the environm
   \ba = \bmu_{\btheta}(s) + \bsigma_{\btheta} \odot \bepsilon, \quad \bepsilon \sim \mathcal{N}(\mathbf{0}, \mathbf{I})
   \label{eq:reparam}
 \end{equation}
-so that gradients flow through both $\bmu_{\btheta}$ and $\bsigma_{\btheta} = \exp(\log\bsigma_{\btheta})$ into the environment dynamics. Each iteration anneals the learning rate, then performs $N_{\text{grad}}$ gradient steps. Per step: a full episode (or segment) is rolled out with the computation graph intact; discounted returns are accumulated; a loss $\cL = -\frac{1}{N}\sum_{i}\sum_{k}(G_k + b_k)$ is computed and backpropagated; and gradients are clipped before the optimizer step. Algorithm~\ref{alg:apg} gives the complete pseudocode.
+so that gradients flow through both $\bmu_{\btheta}$ and $\bsigma_{\btheta} = \exp(\log\bsigma_{\btheta})$ into the environment dynamics. Each iteration anneals the learning rate, then performs $N_{\text{grad}}$ gradient steps. Per step: a full episode, or segments of length $L_{\mathrm{seg}}$, is rolled out with the computation graph intact; segment returns $G_k$ are accumulated; a bootstrap value $b_k$ estimates future return beyond the segment; a loss $\cL = -\frac{1}{N}\sum_{i}\sum_{k}(G_k + b_k)$ is computed and backpropagated; and gradients are clipped before the optimizer step. Algorithm~\ref{alg:apg} gives the complete pseudocode.
 
 \begin{algorithm}[htbp]
   \caption{APG Training Iteration}
   \label{alg:apg}
   \begin{algorithmic}[1]
-    \Require Policy $\pi_{\btheta}$, environment $E$, learning rate $\eta$, segment length $L$
+    \Require Policy $\pi_{\btheta}$, environment $E$, learning rate $\eta$, horizon $H$, segment length $L_{\mathrm{seg}}$
     \For{$\text{grad\_step} = 1, \ldots, N_{\text{grad}}$}
       \State $\nabla_{\btheta} \leftarrow 0$
       \State $\text{policy\_loss} \leftarrow 0$
       \State $\text{obs} \leftarrow E.\text{current\_state}$
-      \For{segment $k = 0, \ldots, \lceil T / L \rceil - 1$}
+      \For{segment $k = 0, \ldots, \lceil H / L_{\mathrm{seg}} \rceil - 1$}
         \State $G_k \leftarrow 0$
-        \For{$t = 0, \ldots, L-1$}
+        \For{$t = 0, \ldots, L_{\mathrm{seg}}-1$}
           \State $a_t \leftarrow \text{differentiable\_action}(\pi_{\btheta}, \text{obs})$ \Comment{reparameterization trick}
           \State $\text{obs}', r_t \leftarrow E.\text{step}(a_t)$ \Comment{graph preserved}
           \State $G_k \leftarrow G_k + \gamma^t \cdot r_t$
@@ -221,7 +232,7 @@ so that gradients flow through both $\bmu_{\btheta}$ and $\bsigma_{\btheta} = \e
 \subsection{Segmented Backpropagation}
 \label{sec:segmentation}
 
-For environments with long horizons, backpropagating through the full episode can lead to vanishing/exploding gradients. APG supports \textbf{segmentation}, where the episode is divided into segments of length $L_{\text{seg}}$, and the gradient chain is broken at segment boundaries:
+For environments with long horizons, backpropagating through the full episode can lead to vanishing/exploding gradients. APG supports \textbf{segmentation}, where the horizon $H$ is divided into $K=\lceil H/L_{\mathrm{seg}}\rceil$ segments and the gradient chain is broken at segment boundaries:
 \begin{itemize}
   \item Within each segment, gradients flow through the full dynamics chain.
   \item At segment boundaries, observations and environment state are detached.
@@ -231,16 +242,24 @@ For environments with long horizons, backpropagating through the full episode ca
 The implementation supports two bootstrap modes:
 
 \begin{enumerate}
-  \item \textbf{MC bootstrap}: Pre-computes future returns by backward accumulation of observed rewards from later segments. These rewards are detached (not differentiable) but provide a fixed target for the current segment's policy loss. Note that the MC future return for segment $k$ represents the discounted sum of rewards within each subsequent segment starting from $\gamma^0$, without an additional $\gamma^{L_k}$ cross-segment discount factor (i.e.\ $b_k = \sum_{t} \gamma^t r_{k+1,t} + \ldots$ rather than $\gamma^{L_k} \sum_t \gamma^t r_{k+1,t} + \ldots$). This differs from the critic bootstrap below.
+  \item \textbf{MC bootstrap}: Pre-computes future returns by backward accumulation of observed rewards from later segments. These rewards are detached (not differentiable) but provide a fixed target for the current segment's policy loss:
+  \[
+    G_k = \sum_{t=0}^{L_k-1}\gamma^t r_{k,t}, \qquad
+    b_k = \gamma^{L_k}(G_{k+1}+b_{k+1}) .
+  \]
 
-  \item \textbf{Critic bootstrap}: Uses a learned value function $V_\phi(s)$ to estimate future returns at segment boundaries, properly discounted by $\gamma^{L_k}$ so that $b_k = \gamma^{L_k} V_\phi(s_{k,\text{end}})$. The critic is trained concurrently via MSE loss against segment returns plus bootstrap values, using a separate (or shared) optimizer learning rate.
+  \item \textbf{Critic bootstrap}: Uses a learned value function $V_\phi(s)$ to estimate future returns at segment boundaries, properly discounted as in the presentation:
+  \[
+    b_k = \gamma^{L_k} V_\phi(s_{k,\mathrm{end}}).
+  \]
+  The critic is trained concurrently via MSE loss against segment returns plus bootstrap values, using a separate (or shared) optimizer learning rate.
 \end{enumerate}
 
 \subsection{Implementation Details}
 \label{sec:implementation}
 
 \paragraph{Differentiable dynamics via native PyTorch autograd.}
-For DiffMountainCarContinuous, PointMassNavigate and PushT, all of which are implemented entirely in PyTorch, APG differentiability is achieved without any special gradient bridge.
+For PointMassSimple, PointMassNavigate and PushT, all of which are implemented entirely in PyTorch, APG differentiability is achieved without any special gradient bridge.
 The \texttt{*APGEnv} subclasses override \texttt{step()} to omit \texttt{torch.no\_grad()} and replace all in-place state updates with out-of-place assignments.
 Concretely, at each step the action is scaled to a force/torque, the damping-then-force Euler update is expressed as
 \[
@@ -249,7 +268,7 @@ Concretely, at each step the action is scaled to a force/torque, the damping-the
 \]
 where every multiplication and addition is a new tensor with a live \texttt{grad\_fn}.
 The reward is then computed from these live tensors, so a single \texttt{loss.backward()} propagates gradients through the entire chain $\ba \to (\mathbf{f}, \tau) \to (\mathbf{v}, \omega) \to (\mathbf{p}, \theta) \to r$.
-The observation returned to the policy is \emph{detached}, as the policy does not need gradients with respect to its own previous outputs; similarly, \texttt{last\_action} is stored detached so it acts as a constant penalty baseline for the action-rate term.
+The observation returned to the policy at each step is constructed from the live \texttt{self.pos} and \texttt{self.vel} tensors (which carry \texttt{grad\_fn}) rather than from detached copies. This is essential for critic bootstrapping in the segmented setting: the value $V_\phi(s_{k,\text{end}})$ computed at the end of segment $k$ can then propagate gradients back through the terminal observation to the policy parameters, effectively extending the gradient horizon past the segment boundary. Only \texttt{last\_action} is stored detached, as it serves as a constant penalty baseline for the action-rate reward term.
 At segment boundaries, \texttt{detach\_state()} replaces every state tensor with its detached clone, preventing gradient chains from accumulating across segments and causing ``backward through the graph a second time'' errors.
 
 \paragraph{Gradient bridge for physics simulation.}
@@ -276,50 +295,52 @@ All linear layers use orthogonal initialization with $\text{std} = \sqrt{2}$ (hi
 
 We evaluate on four continuous-control environments of increasing complexity, each implemented with both a black-box mode (PPO) and a differentiable mode (APG).
 
-\subsection{DiffMountainCarContinuous}
-\label{sec:env_mountaincar}
+\subsection{PointMassSimple}
+\label{sec:env_pointmass_simple}
 
-\paragraph{Task:} Control a car in a one-dimensional valley and accumulate enough momentum to reach the goal on the right hill.
+\paragraph{Task:} Control a one-dimensional point mass and move it to a randomly sampled target position. This environment is the simplest benchmark in our suite: it removes obstacles and orientation while retaining continuous dynamics, stochastic initial states, and a differentiable reward.
 
-\paragraph{State space} (2-dimensional): See Table~\ref{tab:mc_obs}.
+\paragraph{State space} (3-dimensional): See Table~\ref{tab:pms_obs}.
 
 \begin{table}[htbp]
   \centering
-  \caption{DiffMountainCarContinuous observation space.}
-  \label{tab:mc_obs}
+  \caption{PointMassSimple observation space.}
+  \label{tab:pms_obs}
   \begin{tabular}{@{}lll@{}}
     \toprule
     \textbf{Component} & \textbf{Dimensions} & \textbf{Description} \\
     \midrule
-    Position & 1 & $x \in [-1.2, 0.6]$ \\
-    Velocity & 1 & $\dot{x} \in [-0.07, 0.07]$ \\
+    Position & 1 & Point-mass position $p \in [-1, 1]$ at reset \\
+    Velocity & 1 & Scalar velocity $v$ \\
+    Target position & 1 & Goal position $p_g \in [-1, 1]$ at reset \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-\paragraph{Action space:} $\cA = [-1, 1]$ (scalar engine force).
+\paragraph{Action space:} $\cA = [-1, 1]$ (scalar force command).
 
-\paragraph{Reset distribution:} Initial position is sampled uniformly from $[-0.6, -0.4]$ and initial velocity is set to zero, matching the Gymnasium Continuous Mountain Car benchmark.
+\paragraph{Reset distribution:} Position and target are sampled uniformly from $[-1,1]$, while velocity is sampled from a small interval around zero. This gives both algorithms the same randomized start--goal distribution.
 
-\paragraph{Dynamics} (Gym-compatible hill-car update):
+\paragraph{Dynamics} (damped Euler integration, $\Delta t = 0.1$):
 \begin{align}
-  \dot{x}_{t+1} &\leftarrow \text{clip}\!\left(\dot{x}_t + 0.0015\,a_t - 0.0025 \cos(3x_t),\; [-0.07, 0.07]\right) \\
-  x_{t+1} &\leftarrow \text{clip}\!\left(x_t + \dot{x}_{t+1},\; [-1.2, 0.6]\right)
+  f_t &\leftarrow \text{clip}(a_t,\,-1,\,1) \\
+  v_{t+1} &\leftarrow v_t + (f_t - 0.5 v_t)\Delta t \\
+  p_{t+1} &\leftarrow p_t + v_{t+1}\Delta t .
 \end{align}
-If the car hits the left boundary ($x_{t+1} = -1.2$) with negative velocity, we reset $\dot{x}_{t+1}$ to zero. The implementation is written entirely in PyTorch, so gradients flow directly through the transition map except at the clipping boundaries.
+The implementation is written entirely in PyTorch, so gradients flow through $a_t \rightarrow f_t \rightarrow v_{t+1} \rightarrow p_{t+1}$ in APG mode.
 
-\paragraph{Reward:} The differentiable implementation supports both the original Gym reward and a dense shaping used for APG experiments:
-\begin{align}
-  r_t^{\text{gym}} &= 100 \cdot \mathbf{1}[x_{t+1} \ge 0.45 \land \dot{x}_{t+1} \ge 0] - 0.1\,a_t^2 \\
-  r_t^{\text{smooth}} &= 2\,\tilde{x}_{t+1} + 4\,\sigma\!\left(\frac{x_{t+1} - 0.45}{0.02}\right) + 0.5 \frac{\dot{x}_{t+1}}{0.07} - 0.1\,a_t^2
-\end{align}
-where $\tilde{x}_{t+1} = \text{clip}\!\left(\frac{x_{t+1} + 1.2}{0.45 + 1.2},\, 0,\, 1.2\right)$ and $\sigma(\cdot)$ denotes the sigmoid function. Unless otherwise noted, APG uses the smooth reward because the original sparse success bonus provides little analytic signal away from the goal.
+\paragraph{Reward:}
+\begin{equation}
+  r_t = -\left(p_{t+1} - p_g\right)^2 .
+  \label{eq:pms_reward}
+\end{equation}
+This dense quadratic reward supplies a smooth analytic signal throughout the state space while preserving a clear target-reaching objective.
 
-\paragraph{Success condition:} $x \ge 0.45$ and $\dot{x} \ge 0$.
+\paragraph{Success condition:} $|p - p_g| < 0.05$.
 
-\paragraph{Episode length:} 200 steps in the standalone environment implementation; in the unified training script the horizon can be overridden through \texttt{-{}-max\_episode\_steps}.
+\paragraph{Episode length:} 200 steps in the presentation experiments; in the unified training script the horizon can be overridden through \texttt{-{}-max\_episode\_steps}.
 
-\paragraph{APG gradient path:} $a_t \rightarrow \dot{x}_{t+1} \rightarrow x_{t+1} \rightarrow r_t$.
+\paragraph{APG gradient path:} $a_t \rightarrow f_t \rightarrow v_{t+1} \rightarrow p_{t+1} \rightarrow r_t$.
 
 
 \subsection{PointMassNavigate}
@@ -470,22 +491,23 @@ Table~\ref{tab:env_comparison} compares the four environments across key propert
 
 \begin{table}[htbp]
   \centering
+  \small
   \caption{Comparison of environment properties.}
   \label{tab:env_comparison}
-  \begin{tabular}{@{}lllll@{}}
+  \begin{tabularx}{\textwidth}{@{}lXXXX@{}}
     \toprule
-    \textbf{Property} & \textbf{MountainCar} & \textbf{PointMass} & \textbf{PushT} & \textbf{FrankaReach} \\
+    \textbf{Property} & \textbf{PointMassSimple} & \textbf{PointMass} & \textbf{PushT} & \textbf{FrankaReach} \\
     \midrule
-    Observation dim        & 2                    & 14                        & 9                          & 28 \\
+    Observation dim        & 3                    & 14                        & 9                          & 28 \\
     Action dim             & 1                    & 2                         & 3                          & 7 \\
-    Dynamics               & Hill-car (Euler)     & Point mass (Euler)        & 2D rigid body (Euler)      & Articulated body (FK) \\
+    Dynamics               & 1D point mass (Euler)& 2D Point Mass (Euler)        & 2D rigid body (Euler)      & Articulated body (FK) \\
     DOF                    & 1 (pos)              & 2 (pos)                   & 3 (pos + rot)              & 7 (joints) \\
     Max episode steps      & 200                  & 100                       & 100                        & 30 \\
     Gradient bridge        & Native PyTorch       & Native PyTorch            & Native PyTorch             & Warp $\leftrightarrow$ PyTorch \\
-    Obstacles/constraints  & Valley walls         & 2 circles                 & Workspace bounds           & Joint limits \\
+    Obstacles/constraints  & None                 & 2 circles                 & Workspace bounds           & Joint limits \\
     Orientation            & No                   & No                        & Yes ($\theta$)             & Yes (quaternion) \\
     \bottomrule
-  \end{tabular}
+  \end{tabularx}
 \end{table}
 
 % ==============================================================================
@@ -551,7 +573,7 @@ Table~\ref{tab:env_comparison} compares the four environments across key propert
     \toprule
     \textbf{Hyperparameter} & \textbf{Value} \\
     \midrule
-    Gradient steps per iteration   & 16 \\
+    Gradient steps per iteration   & 8 \\
     Per-parameter clip             & 1.0 \\
     Segment length                 & Full episode \\
     Bootstrap mode                 & Critic \\
@@ -585,12 +607,32 @@ We employ a rigorous evaluation protocol to ensure fair comparison:
 \subsection{Experiment Results}
 \label{sec:results}
 
-Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std over 5 seeds) for all four environments, plotted against total gradient steps to enable a fair compute-controlled comparison between PPO and APG. Table~\ref{tab:final_return} summarises the final returns.
+Figure~\ref{fig:return_curves} shows the episodic return curves for all four environments, plotted against total gradient steps to enable a fair compute-controlled comparison between PPO and APG. Table~\ref{tab:final_return} summarises the final returns.
 
 \begin{figure}[htbp]
   \centering
-  \includegraphics[width=\textwidth]{../figures/return_curves}
-  \caption{Episodic return (mean $\pm$ std, 5 seeds) vs.\ total gradient steps for PPO (blue) and APG (orange) across four environments. The x-axis is equalized: both algorithms execute the same total number of gradient updates.}
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/PointMassSimple-v0_return_curve}
+    \caption{PointMassSimple}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/point_mass}
+    \caption{PointMassNavigate}
+  \end{subfigure}
+
+  \vspace{0.5em}
+
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/push_t}
+    \caption{PushT}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/franka_reach}
+    \caption{FrankaReach}
+  \end{subfigure}
+  \caption{Episodic return (mean $\pm$ std) vs.\ total gradient steps for PPO (blue) and APG (orange). The x-axis is equalized: both algorithms execute the same total number of gradient updates.}
   \label{fig:return_curves}
 \end{figure}
 
@@ -603,10 +645,10 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
     \toprule
     \textbf{Environment} & \textbf{PPO (mean $\pm$ std)} & \textbf{APG (mean $\pm$ std)} \\
     \midrule
-    MountainCarContinuous & \tbd & \tbd \\
+    PointMassSimple & $-7.14 \pm 3.87$ & $-5.66 \pm 1.28$ \\
     PointMassNavigate & $-64.89 \pm 11.92$ & $-14.59 \pm 3.36$ \\
-    PushT             & $-2.47 \pm 4.69$   & $-0.64 \pm 0.28$ \\
-    FrankaReach       & $-0.64 \pm 0.44$    & $0.30 \pm 0.03$ \\
+    PushT             & $-12.29 \pm 12.13$   & $0.29 \pm 0.76$ \\
+    FrankaReach       & $-0.09 \pm 0.13$    & $0.73 \pm 0.08$ \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -618,9 +660,9 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
   \label{tab:sample_eff}
   \begin{tabular}{@{}lcrrr@{}}
     \toprule
-    \textbf{Environment} & \textbf{Success Ratio} & \textbf{PPO Steps} & \textbf{APG Steps} & \textbf{APG Speedup} \\
+    \textbf{Environment} & \textbf{Success Ratio} & \textbf{PPO Steps} & \textbf{APG Steps} & \textbf{APG Reduction} \\
     \midrule
-    MountainCarContinuous & \tbd & \tbd & \tbd & \tbd \\
+    PointMassSimple & 100\% & 69120 & 38400 & 1.80x \\
     PointMassNavigate & 20\% & 263360 & 192000 & 1.37x \\
     PushT             & 100\% & 147456 & 138240 & 1.07x \\
     FrankaReach       & 20\% & 1000000 & 230400 & 4.34x \\
@@ -637,7 +679,7 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
     \toprule
     \textbf{Environment} & \textbf{Success Ratio} & \textbf{PPO Grad Steps} & \textbf{APG Grad Steps} & \textbf{APG Speedup} \\
     \midrule
-    MountainCarContinuous & \tbd & \tbd & \tbd & \tbd \\
+    PointMassSimple & 100\% & 2150 & 320 & 6.72x \\
     PointMassNavigate & 20\% & 1104 & 120 & 9.2x \\
     PushT             & 100\% & 560 & 144 & 3.89x \\
     FrankaReach       & 20\% & 3824 & 240 & 15.93x \\
@@ -645,20 +687,78 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
   \end{tabular}
 \end{table}
 
-% ---- Table 4 ----
+\subsection{Ablation: Bootstrap Mode for Segmented APG}
+\label{sec:ablation_bootstrap}
+
+We conduct an ablation study on PointMassNavigate to isolate the effect of the bootstrap strategy in segmented APG (segment length $L=25$, horizon $T=100$, giving 4 segments per episode). Two modes are compared across 3 seeds each:
+
+\begin{itemize}
+  \item \textbf{MC bootstrap}: future returns for each segment are pre-computed by backward accumulation of detached rewards from all subsequent segments, properly discounted by $\gamma^{L_k}$ at each segment boundary.
+  \item \textbf{Critic bootstrap}: a learned value function $V_\phi(s)$ estimates the discounted future return at each segment boundary ($b_k = \gamma^{L_k} V_\phi(s_{k,\text{end}})$). The critic is trained concurrently via MSE regression to segment-level bootstrapped returns. Crucially, $s_{k,\text{end}}$ is kept in the computation graph (not detached), so $\nabla_{\btheta} b_k$ extends the effective gradient horizon through the critic to the terminal state of each segment.
+\end{itemize}
+
+Both modes reach a success rate of $1.0$ by the end of training. The critic bootstrap converges to a slightly higher final episodic return ($-14.44 \pm 3.38$) than MC bootstrap ($-15.31 \pm 2.84$), though the difference is within one standard deviation given three seeds. The critic bootstrap exhibits marginally faster early-phase improvement, consistent with the expected benefit of a learned value function reducing variance in the return estimate at segment boundaries.
+
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/ablation_bootstrap_return}
+    \caption{Return vs.\ environment steps}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/ablation_bootstrap_success}
+    \caption{Success rate vs.\ environment steps}
+  \end{subfigure}
+  \caption{Bootstrap-mode ablation on PointMassNavigate.}
+  \label{fig:ablation_bootstrap}
+\end{figure}
+
+
+\subsection{Ablation: Segment Length with MC and Critic Bootstrap}
+\label{sec:ablation_segment}
+
+To understand how segment length $L$ interacts with the bootstrap strategy, we sweep $L \in \{10, 25, 50\}$ under both MC and critic bootstrap on PointMassNavigate (horizon $T=100$, one seed per condition). This isolates the credit-assignment range—shorter segments truncate gradient chains more aggressively, relying more heavily on the bootstrap estimate to carry future-return information across boundaries.
+
+Table~\ref{tab:ablation_segment} summarizes the results.
+
+\textbf{MC bootstrap} is robust across all three segment lengths. Even at $L=10$ (10 segments per episode) it achieves a success rate of 0.9 and converges to a reasonable final return of $-22.3$. Performance improves monotonically with $L$: at $L=25$ and $L=50$ the agent reaches a success rate of 1.0, with final returns of $-15.1$ and $-10.5$ respectively. The consistent gradient signal from pre-computed discounted returns makes MC bootstrap tolerant of shorter horizons.
+
+\textbf{Critic bootstrap} exhibits a strong sensitivity to $L$. At $L=10$, the critic fails to provide reliable bootstrap targets early in training, and the agent converges to a degenerate policy with zero success rate and a return of $-61.7$. At $L=25$ the critic partially recovers (success rate 0.5, return $-34.5$), and at $L=50$ it matches MC bootstrap ($-9.8$, success 1.0). The critic's value estimates require a sufficient gradient horizon to stabilize: when segments are too short, the critic's bootstrapped targets are too noisy to extend effective credit assignment beyond the segment boundary, and the additional critic loss introduces conflicting gradients.
+
+The results suggest that MC bootstrap should be preferred as the default for short-to-medium segment lengths, while critic bootstrap becomes competitive only when $L$ is large enough to supply stable training signal to the value network.
+
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/ablation_segment_return}
+    \caption{Final return}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\textwidth}
+    \includegraphics[width=\textwidth]{../figures/ablation_segment_success}
+    \caption{Success rate}
+  \end{subfigure}
+  \caption{Segment-length ablation on PointMassNavigate.}
+  \label{fig:ablation_segment}
+\end{figure}
+
+% ---- Table: segment length ablation summary ----
 \begin{table}[htbp]
   \centering
-  \caption{Ablation study: effect of APG segment length and bootstrap mode on episodic return.}
-  \label{tab:ablation_seg}
-  \begin{tabular}{@{}clcccc@{}}
+  \caption{Segment length ablation: final episodic return and success rate on PointMassNavigate (1 seed per condition, 500K steps).}
+  \label{tab:ablation_segment}
+  \begin{tabular}{@{}llrr@{}}
     \toprule
-    \textbf{Segment Length} & \textbf{Bootstrap} & \textbf{MountainCar} & \textbf{PointMass} & \textbf{PushT} & \textbf{FrankaReach} \\
+    \textbf{Bootstrap} & \textbf{$L$} & \textbf{Final Return} & \textbf{Success Rate} \\
     \midrule
-    Full episode & ---    & \tbd & $-5.25 \pm 3.36$ & $-0.64 \pm 0.28$ & N/A \\
-    10           & MC     & \tbd & $-4.23 \pm 1.80$ & $-0.25 \pm 0.50$ & N/A \\
-    10           & Critic & \tbd & $-4.23 \pm 1.80$ & $-0.25 \pm 0.50$ & N/A \\
-    5            & MC     & \tbd & $-4.08 \pm 0.60$ & $-0.41 \pm 0.05$ & N/A \\
-    5            & Critic & \tbd & $-4.08 \pm 0.60$ & $-0.41 \pm 0.05$ & N/A \\
+    MC     & 10 & $-22.3$ & 0.90 \\
+    MC     & 25 & $-15.1$ & 1.00 \\
+    MC     & 50 & $-10.5$ & 1.00 \\
+    \midrule
+    Critic & 10 & $-61.7$ & 0.00 \\
+    Critic & 25 & $-34.5$ & 0.50 \\
+    Critic & 50 & $-9.8$  & 1.00 \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -670,16 +770,14 @@ Figure~\ref{fig:return_curves} shows the episodic return curves (mean $\pm$ std 
 \subsection{Summary}
 \label{sec:summary}
 
-We presented a unified framework for comparing Analytic Policy Gradients (APG) and Proximal Policy Optimization (PPO) across four differentiable continuous control environments. The design of the framework surfaces four key research questions whose empirical answers are deferred pending completed experiments:
-
-% Fill in concrete findings after experiments
+We presented a unified framework for comparing Analytic Policy Gradients (APG) and Proximal Policy Optimization (PPO) across four differentiable continuous control environments. Experiments on PointMassSimple, PointMassNavigate, PushT, and FrankaReach yield four concrete findings:
 
 \begin{enumerate}
-  \item \textbf{Gradient quality vs.\ variance:} APG computes exact policy gradients by backpropagating through dynamics, bypassing the variance inherent in Monte Carlo advantage estimation. Whether this translates to faster or more stable policy improvement depends on the conditioning of the gradient chain.
+  \item \textbf{Gradient quality vs.\ variance:} APG computes exact policy gradients by backpropagating through dynamics, bypassing the variance inherent in Monte Carlo advantage estimation. Across the tested environments APG converges to high success rates and higher final returns, confirming that exact gradients provide a reliable training signal.
 
-  \item \textbf{Sample efficiency trade-off:} PPO performs 4 update epochs over 4 minibatches per rollout (16 gradient steps per environment interaction). APG uses one gradient step per rollout. The per-sample quality of APG gradients must compensate for this asymmetry to achieve competitive wall-clock performance.
+  \item \textbf{Sample efficiency:} APG requires substantially fewer gradient steps than PPO to reach comparable performance thresholds (Table~\ref{tab:grad_eff}): 6.7$\times$ fewer on PointMassSimple, 9.2$\times$ fewer on PointMassNavigate, 3.9$\times$ on PushT, and 15.9$\times$ on FrankaReach, demonstrating that the per-step quality of analytic gradients more than compensates for PPO's multi-epoch update schedule.
 
-  \item \textbf{Scalability with dynamics complexity:} APG's advantage is expected to be most pronounced in smooth, low-dimensional environments (DiffMountainCarContinuous, PointMassNavigate) and may diminish in high-DOF articulated-body settings (FrankaReach) where long gradient chains through forward kinematics can introduce instability.
+  \item \textbf{Segmentation and bootstrap strategy matter:} The segment length ablation (Section~\ref{sec:ablation_segment}) shows that MC bootstrap degrades gracefully as $L$ shrinks (success rate 0.9 at $L=10$), while critic bootstrap collapses entirely at $L=10$ (success rate 0.0) and recovers only at $L=50$. MC bootstrap is therefore the more robust default for short-to-medium horizons; critic bootstrap offers competitive final performance only when the segment length is large enough to stabilize its value targets.
 
   \item \textbf{Gradient bridge feasibility:} Our custom \texttt{torch.autograd.Function} demonstrates that analytic policy gradients are practical for GPU-accelerated physics engines that do not natively expose PyTorch-compatible derivatives, broadening APG beyond analytically specified environments.
 \end{enumerate}
@@ -707,7 +805,7 @@ We presented a unified framework for comparing Analytic Policy Gradients (APG) a
   The differentiability requirement currently restricts APG to analytically specified simulators. A natural generalization is to treat learned neural world models as the differentiable substrate, backpropagating policy gradients through model-predicted rollouts rather than ground-truth dynamics. Recent model-based RL systems such as DreamerV3~\cite{hafner2023dreamerv3} and TD-MPC2~\cite{hansen2024tdmpc2} demonstrate that latent imagination with differentiable recurrent transitions enables competitive policy optimization without environment rollouts. However, gradient compounding through approximate models introduces model-bias error that can dominate the variance reduction benefit. A systematic study comparing APG gradient quality under ground-truth versus learned dynamics---as a function of model capacity, rollout horizon, and Lipschitz constant---would clarify when learned-model gradients remain reliable signals and when model errors corrupt the optimization landscape.
 
   \item \textbf{Principled adaptive segment-length scheduling.}
-  Our ablation (Table~\ref{tab:ablation_seg}) reveals that shorter segment lengths reduce episodic return variance at the cost of truncated credit assignment. A theoretically principled curriculum could adapt the segment length $L_{\mathrm{seg}}$ online based on the gradient signal-to-noise ratio~\cite{pascanu2013exploding} or the convergence of the critic's bootstrap targets. Formally, the optimal segment length balances the bias introduced by truncated BPTT against gradient variance, an objective analogous to the $\lambda$ selection problem in GAE. Adaptive schedules grounded in this bias--variance decomposition, potentially implemented via meta-gradient methods that differentiate through the segment-length choice, would provide a more robust alternative to the fixed-length ablation studied here.
+  Our segment length ablation (Section~\ref{sec:ablation_segment}, Table~\ref{tab:ablation_segment}) reveals a clear bias--variance trade-off: shorter segments reduce memory overhead and gradient chain length but truncate credit assignment, and the impact is particularly severe for critic bootstrap. A theoretically principled curriculum could adapt $L_{\mathrm{seg}}$ online based on the gradient signal-to-noise ratio~\cite{pascanu2013exploding} or the convergence of the critic's bootstrap targets. The optimal segment length balances the bias introduced by truncated BPTT against gradient variance, an objective analogous to the $\lambda$ selection problem in GAE. Adaptive schedules grounded in this bias--variance decomposition, potentially implemented via meta-gradient methods that differentiate through the segment-length choice, would provide a more robust alternative to the fixed-length ablation studied here.
 
 \end{enumerate}
 
@@ -797,11 +895,52 @@ We presented a unified framework for comparing Analytic Policy Gradients (APG) a
 \section{Training Curves}
 \label{sec:appendix_curves}
 
-See Figure~\ref{fig:return_curves} in Section~\ref{sec:results} for the return curves (mean $\pm$ std, 5 seeds) plotted against total gradient steps for all four environments.
+Figures~\ref{fig:curve_pointmass}--\ref{fig:curve_franka} show the per-environment episodic return curves from the GitHub figure set at larger scale.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.7\textwidth]{../figures/point_mass}
+  \caption{PointMassNavigate v0: episodic return (mean $\pm$ std, 5 seeds) vs.\ global steps.}
+  \label{fig:curve_pointmass}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.7\textwidth]{../figures/push_t}
+  \caption{PushT v0: episodic return (mean $\pm$ std, 3 seeds) vs.\ global steps.}
+  \label{fig:curve_pusht}
+\end{figure}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.7\textwidth]{../figures/franka_reach}
+  \caption{FrankaReach v0: episodic return (mean $\pm$ std, 5 seeds) vs.\ global steps.}
+  \label{fig:curve_franka}
+\end{figure}
 
 \section{Environment Visualizations}
 \label{sec:appendix_vis}
 
-% Insert example rendered frames or episode GIFs for each environment
+Rendered frames and GIFs for the custom differentiable environments are produced by the environment-specific renderers during evaluation. PointMassSimple renders the one-dimensional track, target marker, success band, current position, and velocity arrow; PointMassNavigate, PushT, and FrankaReach use analogous task-specific visualizations.
+
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[b]{0.32\textwidth}
+    \includegraphics[width=\textwidth]{../figures/point_mass_env}
+    \caption{PointMassNavigate}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.32\textwidth}
+    \includegraphics[width=\textwidth]{../figures/push_t_env}
+    \caption{PushT}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.32\textwidth}
+    \includegraphics[width=\textwidth]{../figures/franka_env}
+    \caption{FrankaReach}
+  \end{subfigure}
+  \caption{Environment renderings from the GitHub figure set.}
+  \label{fig:env_visualizations}
+\end{figure}
 
 \end{document}
