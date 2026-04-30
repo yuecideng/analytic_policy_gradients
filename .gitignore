@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+tea_debug.log
+
+# Experiment outputs
+runs/
+wandb/
+videos/
+figures/*.gif
+
+# LaTeX build artifacts
+*.aux
+*.lof
+*.log
+*.pdf
+*.toc
+*.synctex.gz
+*.out
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+
+# Slides build artifacts
+slides/node_modules/
+slides/math/
+*.pptx
+
+# Viewer config
+imgui.ini
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Claude Code
+CLAUDE.md
+slides/*

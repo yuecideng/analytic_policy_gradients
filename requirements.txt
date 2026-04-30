@@ -1,0 +1,12 @@
+torch>=2.0
+gymnasium>=0.29
+numpy>=1.24
+tyro>=0.5
+tensorboard>=2.14
+matplotlib>=3.7
+
+# Optional: Weights & Biases logging
+# wandb>=0.16
+
+# Optional: FrankaReach-v0 environment (requires CUDA)
+newton==1.1.0

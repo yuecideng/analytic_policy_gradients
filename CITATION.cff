@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "Backpropagating Through Simulation: Analytic Policy Gradients for Sample and Learning Efficient Differentiable Continuous Control"
+authors:
+  - family-names: Deng
+    given-names: Yueci
+repository-code: https://github.com/yuecideng/analytic_policy_gradients
+year: 2026
+license: MIT
