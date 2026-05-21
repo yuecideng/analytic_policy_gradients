@@ -651,9 +651,9 @@ class FrankaReachVecEnv:
 
         self.viewer.log_lines(
             "/target_axes",
-            wp.array(t_begins, dtype=wp.vec3),
-            wp.array(t_ends, dtype=wp.vec3),
-            wp.array(t_colors, dtype=wp.vec3),
+            wp.array(t_begins, dtype=wp.vec3, device="cpu"),
+            wp.array(t_ends, dtype=wp.vec3, device="cpu"),
+            wp.array(t_colors, dtype=wp.vec3, device="cpu"),
             width=0.02,
         )
 
@@ -693,9 +693,9 @@ class FrankaReachVecEnv:
 
         self.viewer.log_lines(
             "/ee_axes",
-            wp.array(e_begins, dtype=wp.vec3),
-            wp.array(e_ends, dtype=wp.vec3),
-            wp.array(e_colors, dtype=wp.vec3),
+            wp.array(e_begins, dtype=wp.vec3, device="cpu"),
+            wp.array(e_ends, dtype=wp.vec3, device="cpu"),
+            wp.array(e_colors, dtype=wp.vec3, device="cpu"),
             width=0.01,
         )
 
@@ -1043,7 +1043,12 @@ class FrankaReachAPGEnv(FrankaReachVecEnv):
         )
 
         truncated = self.step_count >= self.max_episode_steps
-        terminated = self._check_success()
+        terminated = _check_success(
+            eef_poses[:, :3],
+            eef_poses[:, 3:7],
+            self.target_pos,
+            self.target_quat,
+        )
         done_mask = truncated | terminated
 
         infos = {
