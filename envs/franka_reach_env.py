@@ -559,8 +559,13 @@ class FrankaReachVecEnv:
             torch.arange(self._num_envs, device=self.device),
             self.ee_body_indices,
         ]
+        final_pos_distance = (eef_pose[:, :3] - self.target_pos).norm(dim=-1).detach()
+        final_rot_distance = _quat_distance(
+            eef_pose[:, 3:7], self.target_quat
+        ).detach()
         infos = {
-            "final_distance": (eef_pose[:, :3] - self.target_pos).norm(dim=-1).detach(),
+            "final_distance": final_pos_distance,
+            "final_rot_distance": final_rot_distance,
             "success": terminated.detach(),
         }
 
@@ -1075,10 +1080,13 @@ class FrankaReachAPGEnv(FrankaReachVecEnv):
         )
         done_mask = truncated | terminated
 
+        final_pos_distance = (eef_poses[:, :3] - self.target_pos).norm(dim=-1).detach()
+        final_rot_distance = _quat_distance(
+            eef_poses[:, 3:7], self.target_quat
+        ).detach()
         infos = {
-            "final_distance": (eef_poses[:, :3] - self.target_pos)
-            .norm(dim=-1)
-            .detach(),
+            "final_distance": final_pos_distance,
+            "final_rot_distance": final_rot_distance,
             "success": terminated.detach(),
         }
 

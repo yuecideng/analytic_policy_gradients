@@ -140,6 +140,12 @@ def run_apg(
                                 infos["final_distance"][done_mask].mean().item(),
                                 global_step,
                             )
+                        if "final_rot_distance" in infos:
+                            writer.add_scalar(
+                                "charts/mean_final_rot_distance",
+                                infos["final_rot_distance"][done_mask].mean().item(),
+                                global_step,
+                            )
                         if (
                             should_print_episodes
                             and episode_count % args.print_every_n_episodes == 0

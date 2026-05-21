@@ -19,6 +19,7 @@ def deterministic_eval(
     completed_lengths = []
     completed_successes = []
     completed_final_dists = []
+    completed_final_rot_dists = []
     obs, _ = eval_envs.reset()
     obs = obs.to(device)
     ep_ret = torch.zeros(eval_envs.num_envs, dtype=torch.float32, device=device)
@@ -56,6 +57,12 @@ def deterministic_eval(
                         if isinstance(infos["final_distance"], torch.Tensor)
                         else infos["final_distance"][i]
                     )
+                if "final_rot_distance" in infos:
+                    completed_final_rot_dists.append(
+                        infos["final_rot_distance"][i].item()
+                        if isinstance(infos["final_rot_distance"], torch.Tensor)
+                        else infos["final_rot_distance"][i]
+                    )
             ep_ret[done_mask] = 0.0
             ep_len[done_mask] = 0
 
@@ -88,6 +95,12 @@ def deterministic_eval(
             writer.add_scalar(
                 "eval/mean_final_distance",
                 np.mean(completed_final_dists[:n]),
+                global_step,
+            )
+        if completed_final_rot_dists:
+            writer.add_scalar(
+                "eval/mean_final_rot_distance",
+                np.mean(completed_final_rot_dists[:n]),
                 global_step,
             )
         print(
