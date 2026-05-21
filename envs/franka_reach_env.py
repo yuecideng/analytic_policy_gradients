@@ -482,9 +482,33 @@ class FrankaReachVecEnv:
             self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
         )
 
-        target_pos, target_quat = _sample_target(len(local_env_ids), device=self.device)
-        self.target_pos[local_env_ids] = target_pos
-        self.target_quat[local_env_ids] = target_quat
+        goal_joint_q_t = default_q.unsqueeze(0).expand(len(local_env_ids), -1).clone()
+        goal_joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] = (
+            self.arm_joint_limit_lower
+            + torch.rand(
+                len(local_env_ids), FRANKA_NUM_ARM_JOINTS, device=self.device
+            )
+            * (self.arm_joint_limit_upper - self.arm_joint_limit_lower)
+        )
+
+        # IK targets are sampled from FK, so every target pose is feasible.
+        with torch.no_grad():
+            joint_q[local_env_ids] = goal_joint_q_t
+        newton.eval_fk(
+            self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
+        )
+        body_q_t = wp.to_torch(self.state_0.body_q).view(self._num_envs, -1, 7)
+        ee_indices = self.ee_body_indices.to(device=self.device, dtype=torch.long)
+        goal_eef_pose = body_q_t[local_env_ids, ee_indices[local_env_ids]].detach()
+        self.target_pos[local_env_ids] = goal_eef_pose[:, :3]
+        self.target_quat[local_env_ids] = goal_eef_pose[:, 3:7]
+
+        with torch.no_grad():
+            joint_q[local_env_ids] = joint_q_t
+        newton.eval_fk(
+            self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
+        )
+
         self._render_current_state()
         return self._get_obs(), {}
 
