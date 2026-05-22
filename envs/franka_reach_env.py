@@ -454,23 +454,17 @@ class FrankaReachVecEnv:
 
         self.step_count[local_env_ids] = 0
 
-        # Randomize arm joints by scale in [0.5, 1.5] around default (IsaacLab reset_joints_by_scale).
-        default_arm_q = torch.tensor(
-            DEFAULT_ARM_JOINT_Q, dtype=torch.float32, device=self.device
-        )
-        scales = torch.empty(
-            len(local_env_ids), FRANKA_NUM_ARM_JOINTS, device=self.device
-        ).uniform_(0.5, 1.5)
-        arm_q = torch.clamp(
-            default_arm_q * scales,
-            self.arm_joint_limit_lower,
-            self.arm_joint_limit_upper,
-        )
         default_q = torch.tensor(
             DEFAULT_JOINT_Q, dtype=torch.float32, device=self.device
         )
         joint_q_t = default_q.unsqueeze(0).expand(len(local_env_ids), -1).clone()
-        joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] = arm_q
+        joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] = (
+            self.arm_joint_limit_lower
+            + torch.rand(
+                len(local_env_ids), FRANKA_NUM_ARM_JOINTS, device=self.device
+            )
+            * (self.arm_joint_limit_upper - self.arm_joint_limit_lower)
+        )
 
         joint_q = wp.to_torch(self.state_0.joint_q).view(self._num_envs, -1)
         with torch.no_grad():
