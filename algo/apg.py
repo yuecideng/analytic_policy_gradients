@@ -321,21 +321,21 @@ def run_apg(
                 "by_wall_time/learning_rate", optimizer.param_groups[0]["lr"], elapsed
             )
 
-            # Deterministic evaluation
-            if eval_envs is not None and iteration % args.eval_freq == 0:
-                eval_result = deterministic_eval(
-                    agent,
-                    obs_normalizer,
-                    args,
-                    device,
-                    eval_envs,
-                    writer,
-                    global_step,
-                    total_grad_steps,
+        # Deterministic evaluation
+        if eval_envs is not None and iteration % args.eval_freq == 0:
+            eval_result = deterministic_eval(
+                agent,
+                obs_normalizer,
+                args,
+                device,
+                eval_envs,
+                writer,
+                global_step,
+                total_grad_steps,
+            )
+            if eval_result["success_rate"] is not None:
+                eval_success_rates.append(
+                    (total_grad_steps, eval_result["success_rate"])
                 )
-                if eval_result["success_rate"] is not None:
-                    eval_success_rates.append(
-                        (total_grad_steps, eval_result["success_rate"])
-                    )
 
     return global_step, eval_success_rates

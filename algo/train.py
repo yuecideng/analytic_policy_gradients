@@ -8,6 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from algo.agent import Agent, RunningObsNormalizer
 from algo.env_utils import _create_eval_envs, make_custom_vec_env, make_env
+from algo.evaluate import deterministic_eval
 from algo.ppo import run_ppo
 from algo.apg import run_apg
 from utils import set_seed
@@ -123,8 +124,24 @@ def _run_training(args, seed):
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
-    start_time = time.time()
     should_print_episodes = args.print_every_n_episodes > 0
+    initial_eval_success_rates = []
+
+    if eval_envs is not None:
+        eval_result = deterministic_eval(
+            agent,
+            obs_normalizer,
+            args,
+            device,
+            eval_envs,
+            writer,
+            global_step,
+            0,
+        )
+        if eval_result["success_rate"] is not None:
+            initial_eval_success_rates.append((0, eval_result["success_rate"]))
+
+    start_time = time.time()
 
     if args.algorithm == "ppo":
         global_step, eval_success_rates = run_ppo(
@@ -155,6 +172,8 @@ def _run_training(args, seed):
             should_print_episodes,
             use_critic=use_critic,
         )
+
+    eval_success_rates = initial_eval_success_rates + eval_success_rates
 
     # Compute AUC of success rate curve
     if eval_success_rates:
