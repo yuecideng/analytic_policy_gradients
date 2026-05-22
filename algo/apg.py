@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from algo.checkpoint import save_best_checkpoint
 from algo.evaluate import deterministic_eval
 
 
@@ -22,12 +23,15 @@ def run_apg(
     start_time,
     should_print_episodes,
     use_critic,
+    checkpoint_dir=None,
+    best_eval_success_rate=None,
 ):
     """Run the APG training loop. Returns (global_step, eval_success_rates)."""
     eval_success_rates = []
     episode_count = 0
     total_grad_steps = 0
     total_optim_steps = 0
+    next_eval_step = args.eval_interval_steps if args.eval_interval_steps > 0 else None
 
     # Stateful: reset once, carry env state forward across gradient steps.
     obs, _ = envs.reset(seed=args.seed)
@@ -322,7 +326,14 @@ def run_apg(
             )
 
         # Deterministic evaluation
-        if eval_envs is not None and iteration % args.eval_freq == 0:
+        should_eval = False
+        if eval_envs is not None:
+            if args.eval_interval_steps > 0:
+                should_eval = global_step >= next_eval_step
+            else:
+                should_eval = iteration % args.eval_freq == 0
+
+        if should_eval:
             eval_result = deterministic_eval(
                 agent,
                 obs_normalizer,
@@ -334,8 +345,28 @@ def run_apg(
                 total_grad_steps,
             )
             if eval_result["success_rate"] is not None:
+                if (
+                    checkpoint_dir is not None
+                    and (
+                        best_eval_success_rate is None
+                        or eval_result["success_rate"] > best_eval_success_rate
+                    )
+                ):
+                    best_eval_success_rate = eval_result["success_rate"]
+                    save_best_checkpoint(
+                        checkpoint_dir,
+                        agent,
+                        obs_normalizer,
+                        args,
+                        global_step,
+                        total_grad_steps,
+                        best_eval_success_rate,
+                    )
                 eval_success_rates.append(
                     (total_grad_steps, eval_result["success_rate"])
                 )
+            if args.eval_interval_steps > 0:
+                while next_eval_step <= global_step:
+                    next_eval_step += args.eval_interval_steps
 
     return global_step, eval_success_rates

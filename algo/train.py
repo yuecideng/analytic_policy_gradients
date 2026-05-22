@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
@@ -7,6 +8,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 from algo.agent import Agent, RunningObsNormalizer
+from algo.checkpoint import save_best_checkpoint
 from algo.env_utils import _create_eval_envs, make_custom_vec_env, make_env
 from algo.evaluate import deterministic_eval
 from algo.ppo import run_ppo
@@ -78,7 +80,9 @@ def _run_training(args, seed):
 
     # Eval env setup (separate from training env)
     eval_envs = (
-        _create_eval_envs(args, device, run_name) if args.eval_freq > 0 else None
+        _create_eval_envs(args, device, run_name)
+        if args.eval_freq > 0 or args.eval_interval_steps > 0
+        else None
     )
 
     # optimizer setup
@@ -124,6 +128,8 @@ def _run_training(args, seed):
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
+    checkpoint_dir = Path("checkpoints") / run_name
+    best_eval_success_rate = None
     should_print_episodes = args.print_every_n_episodes > 0
     initial_eval_success_rates = []
 
@@ -139,7 +145,17 @@ def _run_training(args, seed):
             0,
         )
         if eval_result["success_rate"] is not None:
-            initial_eval_success_rates.append((0, eval_result["success_rate"]))
+            best_eval_success_rate = eval_result["success_rate"]
+            save_best_checkpoint(
+                checkpoint_dir,
+                agent,
+                obs_normalizer,
+                args,
+                global_step,
+                0,
+                best_eval_success_rate,
+            )
+            initial_eval_success_rates.append((0, best_eval_success_rate))
 
     start_time = time.time()
 
@@ -156,6 +172,8 @@ def _run_training(args, seed):
             global_step,
             start_time,
             should_print_episodes,
+            checkpoint_dir=checkpoint_dir,
+            best_eval_success_rate=best_eval_success_rate,
         )
     else:
         global_step, eval_success_rates = run_apg(
@@ -171,6 +189,8 @@ def _run_training(args, seed):
             start_time,
             should_print_episodes,
             use_critic=use_critic,
+            checkpoint_dir=checkpoint_dir,
+            best_eval_success_rate=best_eval_success_rate,
         )
 
     eval_success_rates = initial_eval_success_rates + eval_success_rates
