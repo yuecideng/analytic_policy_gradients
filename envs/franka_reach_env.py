@@ -298,6 +298,7 @@ def _compute_reward(
       - position_tracking:             -0.2  * ||pos_ee - pos_cmd||
       - position_tracking_fine_grained: +0.1 * exp(-dist^2 / (2*0.1^2))
       - orientation_tracking:          -0.1  * quat_dist(q_ee, q_cmd)
+      - orientation_tracking_fine:     +0.1 * exp(-rot_dist^2 / (2*0.3^2))
       - action_rate:                   -1e-4 * ||action - prev_action||^2
     """
     pos_dist = (eef_pos - target_pos).norm(dim=-1)
@@ -306,6 +307,7 @@ def _compute_reward(
         -0.2 * pos_dist
         + 0.1 * torch.exp(-(pos_dist**2) / (2 * 0.1**2))
         - 0.1 * rot_dist
+        + 0.1 * torch.exp(-(rot_dist**2) / (2 * 0.3**2))
     )
     if action is not None and last_action is not None:
         action_rate = ((action - last_action) ** 2).sum(dim=-1)
@@ -807,6 +809,7 @@ def _compute_full_reward_kernel(
         wp.float32(-0.2) * pos_dist
         + wp.float32(0.1) * wp.exp(-pos_dist * pos_dist / wp.float32(0.02))
         - wp.float32(0.1) * rot_dist
+        + wp.float32(0.1) * wp.exp(-rot_dist * rot_dist / wp.float32(0.18))
         - wp.float32(0.0001) * action_rate
     )
 
