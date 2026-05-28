@@ -98,8 +98,8 @@ class Args:
     # Seed sweep & evaluation
     num_seeds: int = 1
     """number of seeds to sweep (runs training N times with seeds 1..N)"""
-    eval_freq: int = 0
-    """evaluate every N iterations (0 = disabled; computed as num_iterations // 10 at runtime)"""
+    eval_grad_interval: int = 0
+    """evaluate every N gradient/optimizer steps (0 = auto: ~20 evals across training)"""
     eval_episodes: int = 10
     """number of episodes per deterministic evaluation"""
 

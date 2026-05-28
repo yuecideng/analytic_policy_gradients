@@ -31,7 +31,7 @@ def run_apg(
     episode_count = 0
     total_grad_steps = 0
     total_optim_steps = 0
-    next_eval_step = args.eval_interval_steps if args.eval_interval_steps > 0 else None
+    next_eval_grad = args.eval_grad_interval
 
     # Stateful: reset once, carry env state forward across gradient steps.
     obs, _ = envs.reset(seed=args.seed)
@@ -326,12 +326,7 @@ def run_apg(
             )
 
         # Deterministic evaluation
-        should_eval = False
-        if eval_envs is not None:
-            if args.eval_interval_steps > 0:
-                should_eval = global_step >= next_eval_step
-            else:
-                should_eval = iteration % args.eval_freq == 0
+        should_eval = eval_envs is not None and total_optim_steps >= next_eval_grad
 
         if should_eval:
             eval_result = deterministic_eval(
@@ -365,8 +360,7 @@ def run_apg(
                 eval_success_rates.append(
                     (total_grad_steps, eval_result["success_rate"])
                 )
-            if args.eval_interval_steps > 0:
-                while next_eval_step <= global_step:
-                    next_eval_step += args.eval_interval_steps
+            while next_eval_grad <= total_optim_steps:
+                next_eval_grad += args.eval_grad_interval
 
     return global_step, eval_success_rates

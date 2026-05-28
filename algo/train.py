@@ -81,7 +81,7 @@ def _run_training(args, seed):
     # Eval env setup (separate from training env)
     eval_envs = (
         _create_eval_envs(args, device, run_name)
-        if args.eval_freq > 0 or args.eval_interval_steps > 0
+        if args.eval_grad_interval > 0
         else None
     )
 
