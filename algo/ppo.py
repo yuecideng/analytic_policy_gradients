@@ -281,7 +281,7 @@ def run_ppo(
                     checkpoint_dir is not None
                     and (
                         best_eval_success_rate is None
-                        or eval_result["success_rate"] > best_eval_success_rate
+                        or eval_result["success_rate"] >= best_eval_success_rate
                     )
                 ):
                     best_eval_success_rate = eval_result["success_rate"]
