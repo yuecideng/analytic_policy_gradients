@@ -39,34 +39,34 @@ class RunningObsNormalizer:
 
 
 class Agent(nn.Module):
-    def __init__(self, envs, use_layernorm=False):
+    def __init__(self, envs, use_layernorm=False, hidden_dim=256):
         super().__init__()
         obs_dim = np.array(envs.single_observation_space.shape).prod()
         action_dim = np.array(envs.single_action_space.shape).prod()
 
         layers = [
-            layer_init(nn.Linear(obs_dim, 256)),
+            layer_init(nn.Linear(obs_dim, hidden_dim)),
             nn.Tanh(),
         ]
         if use_layernorm:
-            layers.append(nn.LayerNorm(256))
+            layers.append(nn.LayerNorm(hidden_dim))
         layers += [
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
             nn.Tanh(),
         ]
         if use_layernorm:
-            layers.append(nn.LayerNorm(256))
-        layers.append(layer_init(nn.Linear(256, action_dim), std=0.01))
+            layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(layer_init(nn.Linear(hidden_dim, action_dim), std=0.01))
         self.actor_mean = nn.Sequential(*layers)
         # Smaller initial std for stability in physics sim (exp(-2.0) ≈ 0.135)
         self.actor_log_std = nn.Parameter(torch.full((1, action_dim), -2.0))
 
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 256)),
+            layer_init(nn.Linear(obs_dim, hidden_dim)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 1), std=1.0),
+            layer_init(nn.Linear(hidden_dim, 1), std=1.0),
         )
 
     def get_value(self, x):

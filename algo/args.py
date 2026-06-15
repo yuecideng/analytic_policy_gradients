@@ -46,6 +46,8 @@ class Args:
     """the number of steps to run in each environment per policy rollout"""
 
     # Shared hyperparameters
+    hidden_dim: int = 256
+    """hidden dimension of actor/critic MLPs"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
     anneal_lr: bool = True

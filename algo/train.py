@@ -76,7 +76,9 @@ def _run_training(args, seed):
         envs.single_action_space, gym.spaces.Box
     ), "only box (continuous) action spaces are supported"
 
-    agent = Agent(envs, use_layernorm=False).to(device)
+    agent = Agent(
+        envs, use_layernorm=False, hidden_dim=args.hidden_dim
+    ).to(device)
 
     # Eval env setup (separate from training env)
     eval_envs = (
