@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from algo.checkpoint import save_best_checkpoint
 from algo.evaluate import deterministic_eval
 
 
@@ -22,12 +23,15 @@ def run_apg(
     start_time,
     should_print_episodes,
     use_critic,
+    checkpoint_dir=None,
+    best_eval_success_rate=None,
 ):
     """Run the APG training loop. Returns (global_step, eval_success_rates)."""
     eval_success_rates = []
     episode_count = 0
     total_grad_steps = 0
     total_optim_steps = 0
+    next_eval_grad = args.eval_grad_interval
 
     # Stateful: reset once, carry env state forward across gradient steps.
     obs, _ = envs.reset(seed=args.seed)
@@ -138,6 +142,12 @@ def run_apg(
                             writer.add_scalar(
                                 "charts/mean_final_distance",
                                 infos["final_distance"][done_mask].mean().item(),
+                                global_step,
+                            )
+                        if "final_rot_distance" in infos:
+                            writer.add_scalar(
+                                "charts/mean_final_rot_distance",
+                                infos["final_rot_distance"][done_mask].mean().item(),
                                 global_step,
                             )
                         if (
@@ -315,21 +325,42 @@ def run_apg(
                 "by_wall_time/learning_rate", optimizer.param_groups[0]["lr"], elapsed
             )
 
-            # Deterministic evaluation
-            if eval_envs is not None and iteration % args.eval_freq == 0:
-                eval_result = deterministic_eval(
-                    agent,
-                    obs_normalizer,
-                    args,
-                    device,
-                    eval_envs,
-                    writer,
-                    global_step,
-                    total_grad_steps,
-                )
-                if eval_result["success_rate"] is not None:
-                    eval_success_rates.append(
-                        (total_grad_steps, eval_result["success_rate"])
+        # Deterministic evaluation
+        should_eval = eval_envs is not None and total_optim_steps >= next_eval_grad
+
+        if should_eval:
+            eval_result = deterministic_eval(
+                agent,
+                obs_normalizer,
+                args,
+                device,
+                eval_envs,
+                writer,
+                global_step,
+                total_grad_steps,
+            )
+            if eval_result["success_rate"] is not None:
+                if (
+                    checkpoint_dir is not None
+                    and (
+                        best_eval_success_rate is None
+                        or eval_result["success_rate"] >= best_eval_success_rate
                     )
+                ):
+                    best_eval_success_rate = eval_result["success_rate"]
+                    save_best_checkpoint(
+                        checkpoint_dir,
+                        agent,
+                        obs_normalizer,
+                        args,
+                        global_step,
+                        total_grad_steps,
+                        best_eval_success_rate,
+                    )
+                eval_success_rates.append(
+                    (total_grad_steps, eval_result["success_rate"])
+                )
+            while next_eval_grad <= total_optim_steps:
+                next_eval_grad += args.eval_grad_interval
 
     return global_step, eval_success_rates

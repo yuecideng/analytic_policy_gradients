@@ -34,6 +34,7 @@ runs/
 wandb/
 videos/
 figures/*.gif
+checkpoints/
 
 # LaTeX build artifacts
 *.aux

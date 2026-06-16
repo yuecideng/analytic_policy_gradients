@@ -46,6 +46,8 @@ class Args:
     """the number of steps to run in each environment per policy rollout"""
 
     # Shared hyperparameters
+    hidden_dim: int = 256
+    """hidden dimension of actor/critic MLPs"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
     anneal_lr: bool = True
@@ -98,8 +100,8 @@ class Args:
     # Seed sweep & evaluation
     num_seeds: int = 1
     """number of seeds to sweep (runs training N times with seeds 1..N)"""
-    eval_freq: int = 0
-    """evaluate every N iterations (0 = disabled; computed as num_iterations // 10 at runtime)"""
+    eval_grad_interval: int = 0
+    """evaluate every N gradient/optimizer steps (0 = auto: ~20 evals across training)"""
     eval_episodes: int = 10
     """number of episodes per deterministic evaluation"""
 

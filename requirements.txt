@@ -6,7 +6,11 @@ tensorboard>=2.14
 matplotlib>=3.7
 
 # Optional: Weights & Biases logging
-# wandb>=0.16
+wandb>=0.16
 
 # Optional: FrankaReach-v0 environment (requires CUDA)
 newton==1.1.0
+
+scipy
+pycollada
+trimesh

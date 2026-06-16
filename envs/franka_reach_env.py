@@ -298,6 +298,7 @@ def _compute_reward(
       - position_tracking:             -0.2  * ||pos_ee - pos_cmd||
       - position_tracking_fine_grained: +0.1 * exp(-dist^2 / (2*0.1^2))
       - orientation_tracking:          -0.1  * quat_dist(q_ee, q_cmd)
+      - orientation_tracking_fine:     +0.1 * exp(-rot_dist^2 / (2*0.3^2))
       - action_rate:                   -1e-4 * ||action - prev_action||^2
     """
     pos_dist = (eef_pos - target_pos).norm(dim=-1)
@@ -306,6 +307,7 @@ def _compute_reward(
         -0.2 * pos_dist
         + 0.1 * torch.exp(-(pos_dist**2) / (2 * 0.1**2))
         - 0.1 * rot_dist
+        + 0.1 * torch.exp(-(rot_dist**2) / (2 * 0.3**2))
     )
     if action is not None and last_action is not None:
         action_rate = ((action - last_action) ** 2).sum(dim=-1)
@@ -454,23 +456,17 @@ class FrankaReachVecEnv:
 
         self.step_count[local_env_ids] = 0
 
-        # Randomize arm joints by scale in [0.5, 1.5] around default (IsaacLab reset_joints_by_scale).
-        default_arm_q = torch.tensor(
-            DEFAULT_ARM_JOINT_Q, dtype=torch.float32, device=self.device
-        )
-        scales = torch.empty(
-            len(local_env_ids), FRANKA_NUM_ARM_JOINTS, device=self.device
-        ).uniform_(0.5, 1.5)
-        arm_q = torch.clamp(
-            default_arm_q * scales,
-            self.arm_joint_limit_lower,
-            self.arm_joint_limit_upper,
-        )
         default_q = torch.tensor(
             DEFAULT_JOINT_Q, dtype=torch.float32, device=self.device
         )
         joint_q_t = default_q.unsqueeze(0).expand(len(local_env_ids), -1).clone()
-        joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] = arm_q
+        joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] = (
+            self.arm_joint_limit_lower
+            + torch.rand(
+                len(local_env_ids), FRANKA_NUM_ARM_JOINTS, device=self.device
+            )
+            * (self.arm_joint_limit_upper - self.arm_joint_limit_lower)
+        )
 
         joint_q = wp.to_torch(self.state_0.joint_q).view(self._num_envs, -1)
         with torch.no_grad():
@@ -482,9 +478,33 @@ class FrankaReachVecEnv:
             self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
         )
 
-        target_pos, target_quat = _sample_target(len(local_env_ids), device=self.device)
-        self.target_pos[local_env_ids] = target_pos
-        self.target_quat[local_env_ids] = target_quat
+        goal_joint_q_t = default_q.unsqueeze(0).expand(len(local_env_ids), -1).clone()
+        goal_joint_q_t[:, :FRANKA_NUM_ARM_JOINTS] = (
+            self.arm_joint_limit_lower
+            + torch.rand(
+                len(local_env_ids), FRANKA_NUM_ARM_JOINTS, device=self.device
+            )
+            * (self.arm_joint_limit_upper - self.arm_joint_limit_lower)
+        )
+
+        # IK targets are sampled from FK, so every target pose is feasible.
+        with torch.no_grad():
+            joint_q[local_env_ids] = goal_joint_q_t
+        newton.eval_fk(
+            self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
+        )
+        body_q_t = wp.to_torch(self.state_0.body_q).view(self._num_envs, -1, 7)
+        ee_indices = self.ee_body_indices.to(device=self.device, dtype=torch.long)
+        goal_eef_pose = body_q_t[local_env_ids, ee_indices[local_env_ids]].detach()
+        self.target_pos[local_env_ids] = goal_eef_pose[:, :3]
+        self.target_quat[local_env_ids] = goal_eef_pose[:, 3:7]
+
+        with torch.no_grad():
+            joint_q[local_env_ids] = joint_q_t
+        newton.eval_fk(
+            self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0
+        )
+
         self._render_current_state()
         return self._get_obs(), {}
 
@@ -535,8 +555,13 @@ class FrankaReachVecEnv:
             torch.arange(self._num_envs, device=self.device),
             self.ee_body_indices,
         ]
+        final_pos_distance = (eef_pose[:, :3] - self.target_pos).norm(dim=-1).detach()
+        final_rot_distance = _quat_distance(
+            eef_pose[:, 3:7], self.target_quat
+        ).detach()
         infos = {
-            "final_distance": (eef_pose[:, :3] - self.target_pos).norm(dim=-1).detach(),
+            "final_distance": final_pos_distance,
+            "final_rot_distance": final_rot_distance,
             "success": terminated.detach(),
         }
 
@@ -651,9 +676,9 @@ class FrankaReachVecEnv:
 
         self.viewer.log_lines(
             "/target_axes",
-            wp.array(t_begins, dtype=wp.vec3),
-            wp.array(t_ends, dtype=wp.vec3),
-            wp.array(t_colors, dtype=wp.vec3),
+            wp.array(t_begins, dtype=wp.vec3, device="cpu"),
+            wp.array(t_ends, dtype=wp.vec3, device="cpu"),
+            wp.array(t_colors, dtype=wp.vec3, device="cpu"),
             width=0.02,
         )
 
@@ -693,9 +718,9 @@ class FrankaReachVecEnv:
 
         self.viewer.log_lines(
             "/ee_axes",
-            wp.array(e_begins, dtype=wp.vec3),
-            wp.array(e_ends, dtype=wp.vec3),
-            wp.array(e_colors, dtype=wp.vec3),
+            wp.array(e_begins, dtype=wp.vec3, device="cpu"),
+            wp.array(e_ends, dtype=wp.vec3, device="cpu"),
+            wp.array(e_colors, dtype=wp.vec3, device="cpu"),
             width=0.01,
         )
 
@@ -784,6 +809,7 @@ def _compute_full_reward_kernel(
         wp.float32(-0.2) * pos_dist
         + wp.float32(0.1) * wp.exp(-pos_dist * pos_dist / wp.float32(0.02))
         - wp.float32(0.1) * rot_dist
+        + wp.float32(0.1) * wp.exp(-rot_dist * rot_dist / wp.float32(0.18))
         - wp.float32(0.0001) * action_rate
     )
 
@@ -1043,13 +1069,21 @@ class FrankaReachAPGEnv(FrankaReachVecEnv):
         )
 
         truncated = self.step_count >= self.max_episode_steps
-        terminated = self._check_success()
+        terminated = _check_success(
+            eef_poses[:, :3],
+            eef_poses[:, 3:7],
+            self.target_pos,
+            self.target_quat,
+        )
         done_mask = truncated | terminated
 
+        final_pos_distance = (eef_poses[:, :3] - self.target_pos).norm(dim=-1).detach()
+        final_rot_distance = _quat_distance(
+            eef_poses[:, 3:7], self.target_quat
+        ).detach()
         infos = {
-            "final_distance": (eef_poses[:, :3] - self.target_pos)
-            .norm(dim=-1)
-            .detach(),
+            "final_distance": final_pos_distance,
+            "final_rot_distance": final_rot_distance,
             "success": terminated.detach(),
         }
 

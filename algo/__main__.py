@@ -33,8 +33,13 @@ def main():
             f"PPO: minibatch_size={args.minibatch_size}, num_iterations={args.num_iterations}"
         )
 
-    if args.eval_freq == 0 and args.num_iterations > 0:
-        args.eval_freq = max(args.num_iterations // 10, 1)
+    if args.eval_grad_interval == 0:
+        if args.algorithm == "apg":
+            total_grad_steps = args.num_iterations * args.apg_num_grad_steps
+        else:
+            total_grad_steps = args.num_iterations * args.update_epochs * args.num_minibatches
+        args.eval_grad_interval = max(total_grad_steps // 20, 1)
+        print(f"eval_grad_interval={args.eval_grad_interval} (~{total_grad_steps // args.eval_grad_interval} evals)")
 
     seeds = list(range(1, args.num_seeds + 1)) if args.num_seeds > 1 else [args.seed]
     for seed_idx, seed in enumerate(seeds):
