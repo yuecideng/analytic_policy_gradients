@@ -40,9 +40,6 @@
 \newcommand{\ba}{\mathbf{a}}
 \newcommand{\bg}{\mathbf{g}}
 
-\newcommand{\yueci}[1]
-{\textcolor{red}{Yueci:{#1}}}
-
 % ---- Listings style ----
 \lstset{
   basicstyle=\ttfamily\small,
@@ -57,7 +54,9 @@
 \title{\textbf{Backpropagating Through Simulation: Analytic Policy Gradients for Sample and Learning Efficient Differentiable Continuous Control}}
 
 \author{
-  Yueci Deng
+  Yueci Deng\\
+  School of Data Science, The Chinese University of Hong Kong, Shenzhen\\
+  \texttt{yuecideng@link.cuhk.edu.cn}
 }
 
 \date{}
@@ -77,7 +76,7 @@ Model-free reinforcement learning algorithms such as Proximal Policy Optimizatio
 
 \subsection{Motivation}
 \label{sec:motivation}
-Reinforcement learning (RL) has achieved remarkable success in domains such as  game playing, robotics, and autonomous control. However, poor sample efficiency remains a core bottleneck that prevents its deployment in the real world. In most practical tasks, every environment interaction incurs non-negligible costs in terms of time, money, or safety. Sample efficiency also remains a fundamental challenge: model-free algorithms such as PPO~\cite{schulman2017ppo} require millions of environment interactions because they treat dynamics as a black box, estimating policy gradients from observed reward signals via Monte Carlo returns or learned value functions, which inevitably introduces high variance and estimation bias
+Reinforcement learning (RL) has achieved remarkable success in domains such as game playing, robotics, and autonomous control. However, poor sample efficiency remains a core bottleneck that prevents its deployment in the real world. In most practical tasks, every environment interaction incurs non-negligible costs in terms of time, money, or safety. Sample efficiency also remains a fundamental challenge: model-free algorithms such as PPO~\cite{schulman2017ppo} require millions of environment interactions because they treat dynamics as a black box, estimating policy gradients from observed reward signals via Monte Carlo returns or learned value functions, which inevitably introduces high variance and estimation bias.
 
 A largely underexploited opportunity is that many modern simulators are inherently differentiable. Physics engines, rendering pipelines, and procedural task generators routinely expose analytic derivatives. When these are available, the expected return becomes a differentiable function of the policy parameters, and exact gradients can be obtained by backpropagating through the dynamics—eliminating the need for advantage estimation~\cite{schulman2016gae}, importance sampling, or entropy regularization.
 
@@ -86,6 +85,16 @@ A largely underexploited opportunity is that many modern simulators are inherent
 
 The remainder of this report is organized as follows. Section~\ref{sec:related} reviews related work. Section~\ref{sec:preliminaries} covers preliminaries on policy gradient methods and PPO. Section~\ref{sec:methodology} describes the APG methodology in detail. Section~\ref{sec:environments} presents the four benchmark environments. Section~\ref{sec:experiments} details the experimental setup and provides result templates. Section~\ref{sec:conclusion} discusses findings and concludes.
 
+\subsection{Contributions}
+\label{sec:contributions}
+Building on prior short-horizon differentiable-RL work~\cite{guo2023shac,xu2022accelerated}, this report makes the following contributions:
+\begin{enumerate}
+  \item \textbf{A unified PPO/APG benchmarking harness.} We implement both algorithms in a single training script with identical actor--critic architectures, observation normalization, learning-rate annealing, and optimizer settings, so that the only varying factor across the comparison is the gradient source.
+  \item \textbf{MC bootstrap as a robust alternative to critic bootstrap.} We introduce a Monte-Carlo bootstrap mode for segmented backpropagation and show, via a segment-length ablation, that it degrades gracefully at short segment lengths where critic bootstrap collapses, making it a safer default for short-to-medium horizons.
+  \item \textbf{A Warp--PyTorch gradient bridge for articulated-body kinematics.} We implement a custom \texttt{torch.autograd.Function} that connects NVIDIA Warp/Newton's tape-based autodiff to PyTorch's autograd, demonstrating that APG is practical on GPU physics engines that do not natively expose PyTorch-compatible derivatives.
+  \item \textbf{A multi-axis evaluation protocol and open environment suite.} We decouple sample efficiency (environment steps) from compute efficiency (gradient steps), report both, and release a four-environment suite of increasing dynamical complexity together with the full implementation.\footnote{\url{https://github.com/yuecideng/analytic_policy_gradients}}
+\end{enumerate}
+
 % ==============================================================================
 \section{Related Work}
 \label{sec:related}
@@ -93,12 +102,12 @@ The remainder of this report is organized as follows. Section~\ref{sec:related} 
 \subsection{Policy Gradient Methods}
 \label{sec:related_pg}
 
-Policy gradient methods optimize parameterized policies by estimating gradients of the expected return. REINFORCE~\cite{williams1992reinforce} introduced the score-function estimator, which trades bias for variance and requires large sample counts. PPO~\cite{schulman2017ppo} improves stability via a clipped surrogate objective, while GAE~\cite{schulman2016gae} reduces advantage estimation variance through a $\lambda$-weighted multi-step return. Despite these advances, all score-function methods treat environment dynamics as a black box and cannot exploit analytic structure in the transition function.
+Policy gradient methods optimize parameterized policies by estimating gradients of the expected return. REINFORCE~\cite{williams1992reinforce} introduced the score-function estimator, which trades bias for variance and requires large sample counts. PPO~\cite{schulman2017ppo} improves stability via a clipped surrogate objective, while GAE~\cite{schulman2016gae} reduces advantage estimation variance through a $\lambda$-weighted multi-step return. Despite these advances, all score-function methods treat environment dynamics as a black box and cannot exploit analytic structure in the transition function. Off-policy entropy-regularized variants such as Soft Actor-Critic~\cite{haarnoja2018sac} improve sample reuse through experience replay but likewise estimate the policy gradient from sampled returns and cannot exploit analytic dynamics.
 
 \subsection{Differentiable Simulation}
 \label{sec:related_diff_sim}
 
-A parallel line of work develops simulators that expose analytic derivatives, enabling gradient-based policy optimization. Degrave et al.~\cite{degrave2019differentiable} demonstrated end-to-end gradient flow through rigid-body physics. Suh et al.~\cite{suh2022differentiable} provided a systematic analysis of when differentiable simulators yield better policy gradients than score-function estimators, identifying the smoothness of the reward landscape and the magnitude of dynamics Jacobians as key determinants. Zhong et al.~\cite{zhong2022differentiable} applied differentiable simulation to system identification, showing that analytic gradients substantially accelerate parameter inference.
+A parallel line of work develops simulators that expose analytic derivatives, enabling gradient-based policy optimization. Degrave et al.~\cite{degrave2019differentiable} demonstrated end-to-end gradient flow through rigid-body physics. Suh et al.~\cite{suh2022differentiable} provided a systematic analysis of when differentiable simulators yield better policy gradients than score-function estimators, identifying the smoothness of the reward landscape and the magnitude of dynamics Jacobians as key determinants. Zhong et al.~\cite{zhong2022differentiable} applied differentiable simulation to system identification, showing that analytic gradients substantially accelerate parameter inference. Contemporary differentiable simulation frameworks expose analytic derivatives on GPU accelerators---for example Brax~\cite{freeman2021brax}, MuJoCo~\cite{todorov2012mujoco} (and its JAX port MJX), DiffTaichi~\cite{hu2020difftaichi}, and NVIDIA Warp/Newton~\cite{nvidia_warp}---and our FrankaReach environment is built directly on the Newton/Warp backend (Section~\ref{sec:gradient_bridge}).
 
 \subsection{Short-Horizon and Segmented Backpropagation}
 \label{sec:related_shac}
@@ -202,6 +211,8 @@ The state total derivative satisfies the recursion obtained by differentiating $
 \end{equation}
 
 Equation~\eqref{eq:apg_state_grad} is precisely backpropagation through time (BPTT)~\cite{werbos1990bptt}: gradients flow backward through the dynamics Jacobians $\tfrac{\partial T}{\partial s_t}$ and $\tfrac{\partial T}{\partial a_t}$, accumulating contributions from all future reward terms. Equations~\eqref{eq:apg_action_grad} and~\eqref{eq:apg_state_grad} are mutually recursive: $\tfrac{d a_t}{d\theta}$ depends on $\tfrac{d s_t}{d\theta}$, which in turn depends on $\tfrac{d a_{t-1}}{d\theta}$. Because actions are sampled via the reparameterization trick, $\tfrac{d a_t}{d\theta}$ carries gradients through both $\bmu_{\btheta}$ and $\bsigma_{\btheta}$. The entire recursion is unrolled automatically by any reverse-mode autodiff framework (e.g.\ PyTorch's \texttt{loss.backward()}), requiring no advantage estimation, importance sampling, or variance reduction.
+
+The variance advantage of pathwise over score-function gradients is not merely heuristic. Suh et al.~\cite{suh2022differentiable} characterize precisely when differentiable simulation yields lower-variance policy gradients: the pathwise estimator dominates when the reward landscape is sufficiently smooth and the dynamics Jacobians are well-conditioned, whereas the score-function estimator remains preferable under discontinuous or highly stochastic transitions. Our benchmark environments are deliberately constructed with smooth dense rewards and deterministic transitions (Section~\ref{sec:environments}), placing them in the regime where pathwise gradients are expected to carry substantially lower variance---consistent with the empirical convergence gains reported in Section~\ref{sec:results}.
 
 The trade-off is that APG requires the transition dynamics $T$ and the reward function $R$ to be differentiable, which restricts the class of applicable environments and models. Furthermore, gradient chains that span the full horizon $H$ can suffer from vanishing or exploding magnitudes, making the optimization unstable and slow to converge. This directly motivates the segmented backpropagation scheme presented in Section~\ref{sec:segmentation}, which truncates the gradient flow into shorter segments to improve numerical stability and learning efficiency.
 \subsection{Training Algorithms}
@@ -377,7 +388,7 @@ This dense quadratic reward supplies a smooth analytic signal throughout the sta
 
 \paragraph{Success condition:} $|p - p_g| < 0.05$.
 
-\paragraph{Episode length:} 200 steps in the presentation experiments; in the unified training script the horizon can be overridden through \texttt{-{}-max\_episode\_steps}.
+\paragraph{Episode length:} 200 steps by default; the horizon can be overridden in the unified training script via \texttt{-{}-max\_episode\_steps}.
 
 \paragraph{APG gradient path:} $a_t \rightarrow f_t \rightarrow v_{t+1} \rightarrow p_{t+1} \rightarrow r_t$.
 
@@ -642,10 +653,16 @@ We employ a rigorous evaluation protocol to ensure fair comparison:
   \item \textbf{Seed sweep:} Results are reported as mean $\pm$ std over multiple random seeds.
 \end{enumerate}
 
+\paragraph{Counting environment steps.}
+To ensure the environment-step axis is comparable across algorithms, we count one environment step as one call to the environment \texttt{step()}---that is, one transition $(s_t, a_t, r_t, s_{t+1})$---irrespective of whether that transition participates in a differentiable computation graph. For PPO, steps accumulate over on-policy rollouts across the parallel environments. For APG, the stateful rollout paradigm (Section~\ref{sec:training_algorithms}) carries environment state across gradient steps, but every executed action still produces exactly one counted transition; resets triggered by episode termination or truncation are not charged to the budget. Because PPO performs multiple update epochs over a stored batch while APG rolls out fresh trajectories per gradient step, the two algorithms consume environment steps at different rates for a fixed number of gradient updates---precisely the confound that motivates reporting the two axes independently.
+
 \subsection{Experiment Results}
 \label{sec:results}
 
-Figure~\ref{fig:return_curves} shows the episodic return curves for all four environments, plotted against total gradient steps to enable a fair compute-controlled comparison between PPO and APG. Table~\ref{tab:final_return} summarises the final returns.
+Figure~\ref{fig:return_curves} shows the episodic return curves for all four environments, plotted against total gradient steps to enable a fair compute-controlled comparison between PPO and APG; the companion environment-step axis is summarized in Table~\ref{tab:sample_eff}. Table~\ref{tab:final_return} summarises the final returns.
+
+\paragraph{Performance thresholds and success ratio.}
+The efficiency tables (Tables~\ref{tab:sample_eff}--\ref{tab:grad_eff}) report the number of environment/gradient steps at which the evaluation episodic return first crosses an environment-specific performance threshold: $-10$ for PointMassNavigate, $-1$ for PushT, and $0.5$ for FrankaReach (PointMassSimple is near-solved by both methods and is reported at full success). The ``Success Ratio'' column reports the final deterministic-evaluation goal-reaching success rate of Section~\ref{sec:eval_protocol}---the fraction of evaluation episodes that terminate at the goal rather than by timeout---which is a strictly stronger criterion than the return threshold: a policy may attain high dense reward yet still fail to satisfy the tight pose/position tolerance required for success. This distinction is important for interpreting the results: for example, on FrankaReach the APG policy achieves a substantially higher dense return than PPO (Table~\ref{tab:final_return}) even though the strict goal-reaching success rate remains partial, because the reward shaping rewards proximity rather than exact pose matching. When an algorithm does not cross the return threshold within its training budget, we report the total budget consumed.
 
 \begin{figure}[htbp]
   \centering
@@ -674,7 +691,6 @@ Figure~\ref{fig:return_curves} shows the episodic return curves for all four env
   \label{fig:return_curves}
 \end{figure}
 
-% ---- Table 1 ----
 \begin{table}[htbp]
   \centering
   \caption{Final performance (episodic return). Results reported as mean $\pm$ std over multiple seeds.}
@@ -691,7 +707,6 @@ Figure~\ref{fig:return_curves} shows the episodic return curves for all four env
   \end{tabular}
 \end{table}
 
-% ---- Table 2 ----
 \begin{table}[htbp]
   \centering
   \caption{Sample efficiency: environment steps to reach performance threshold.}
@@ -708,7 +723,6 @@ Figure~\ref{fig:return_curves} shows the episodic return curves for all four env
   \end{tabular}
 \end{table}
 
-% ---- Table 3 ----
 \begin{table}[htbp]
   \centering
   \caption{Learning efficiency: gradient steps to reach performance threshold.}
@@ -801,6 +815,11 @@ The results suggest that MC bootstrap should be preferred as the default for sho
   \end{tabular}
 \end{table}
 
+\subsection{Reproducibility}
+\label{sec:reproducibility}
+The full implementation, environment definitions, training scripts, and plotting utilities are open-sourced.\footnote{\url{https://github.com/yuecideng/analytic_policy_gradients}} All experiments use a single entry point, \texttt{rl.py}, selecting the algorithm via \texttt{-{}-algorithm \{ppo,apg\}} and the environment via \texttt{-{}-env\_id}; multi-seed sweeps are launched with \texttt{-{}-num\_seeds}, and the \texttt{-{}-equalize\_grad\_steps} flag aligns the total gradient-step budget between PPO and APG for the compute-controlled comparison. The exact commands reproducing each figure are provided in the repository \texttt{scripts/} directory: \texttt{plot\_return\_curves.py} (Fig.~\ref{fig:return_curves}), \texttt{plot\_bootstrap\_ablation.py} (Fig.~\ref{fig:ablation_bootstrap}), \texttt{plot\_segment\_ablation.py} (Fig.~\ref{fig:ablation_segment}), and \texttt{fetch\_results.py} (all result tables, parsed from local TensorBoard logs). Dependencies are listed in \texttt{requirements.txt}; the FrankaReach environment additionally requires \texttt{newton==1.1.0} and a CUDA-capable GPU. Runs are logged to TensorBoard and, optionally, Weights \& Biases (project \texttt{cleanRL}). The reported numbers correspond to commit \texttt{<fill-in>} evaluated on a single \texttt{<GPU model>} GPU.
+% TODO: replace the commit hash and GPU model placeholders above before submission.
+
 % ==============================================================================
 \section{Discussion and Conclusion}
 \label{sec:conclusion}
@@ -811,7 +830,7 @@ The results suggest that MC bootstrap should be preferred as the default for sho
 We presented a unified framework for comparing Analytic Policy Gradients (APG) and Proximal Policy Optimization (PPO) across four differentiable continuous control environments. Experiments on PointMassSimple, PointMassNavigate, PushT, and FrankaReach yield four concrete findings:
 
 \begin{enumerate}
-  \item \textbf{Gradient quality vs.\ variance:} APG computes exact policy gradients by backpropagating through dynamics, bypassing the variance inherent in Monte Carlo advantage estimation. Across the tested environments APG converges to high success rates and higher final returns, confirming that exact gradients provide a reliable training signal.
+  \item \textbf{Gradient quality vs.\ variance:} APG computes exact policy gradients by backpropagating through dynamics, bypassing the variance inherent in Monte Carlo advantage estimation. Across the tested environments APG attains a higher final episodic return than PPO (Table~\ref{tab:final_return}) and reaches full goal-reaching success on the simpler tasks (PointMassSimple, PushT). On the harder tasks (PointMassNavigate, FrankaReach) the strict success rate remains partial even though the dense return improves substantially over PPO---a consequence of the gap between reward shaping and the tight pose tolerance required for success (Section~\ref{sec:results}). This confirms that exact gradients provide a reliable training signal while also delineating where dense-reward convergence does not by itself imply task success.
 
   \item \textbf{Sample efficiency:} APG requires substantially fewer gradient steps than PPO to reach comparable performance thresholds (Table~\ref{tab:grad_eff}): 6.7$\times$ fewer on PointMassSimple, 9.2$\times$ fewer on PointMassNavigate, 3.9$\times$ on PushT, and 15.9$\times$ on FrankaReach, demonstrating that the per-step quality of analytic gradients more than compensates for PPO's multi-epoch update schedule.
 
@@ -933,12 +952,30 @@ We presented a unified framework for comparing Analytic Policy Gradients (APG) a
   Trust Region Policy Optimization.
   \textit{ICML 2015}, 1889--1897.
 
+\bibitem{freeman2021brax}
+  Freeman, C.~D., Frey, E., Raichuk, A., Girgin, S., Mordatch, I., \& Bachem, O. (2021).
+  Brax -- Differentiable Physics for Large Scale Rigid Body Simulation.
+  \textit{arXiv preprint arXiv:2106.13281}.
+
+\bibitem{todorov2012mujoco}
+  Todorov, E., Erez, T., \& Tassa, Y. (2012).
+  MuJoCo: A Physics Engine for Model-Based Control.
+  \textit{IROS 2012}, 5026--5033.
+
+\bibitem{hu2020difftaichi}
+  Hu, Y., Li, T.-M., Anderson, L., Ragan-Kelley, J., \& Durand, F. (2020).
+  DiffTaichi: Differentiable Programming for Physical Simulation.
+  \textit{ICLR 2020}.
+
+\bibitem{nvidia_warp}
+  NVIDIA. (2024).
+  Warp: A Python Framework for High-Performance GPU Simulation and Graphics.
+  \url{https://github.com/NVIDIA/warp}.
+
 \end{thebibliography}
 
 % ==============================================================================
 \appendix
-
-% Fill in after ablation experiments
 
 \section{Environment Visualizations}
 \label{sec:appendix_vis}
