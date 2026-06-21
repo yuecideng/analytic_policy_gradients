@@ -67,8 +67,7 @@
 
 % ==============================================================================
 \begin{abstract}
-Model-free reinforcement learning algorithms such as Proximal Policy Optimization (PPO) treat the environment as a black box, estimating policy gradients from sampled rewards—a process that demands millions of interactions and relies on high-variance advantage estimates. When environment dynamics are differentiable, the return is an end-to-end differentiable function of the policy parameters, enabling exact gradient computation via backpropagation through simulation. We term this approach Analytic Policy Gradients (APG) and evaluate it against PPO on four continuous control tasks of increasing dynamical complexity: a one-dimensional point-mass target-reaching task, a 2D point-mass navigation task with obstacle avoidance, a 2D rigid-body T-block pushing task, and a 7-DOF Franka FR3 end-effector reaching task. Both algorithms share identical model architectures, observation normalization, and optimizer settings. To decouple sample efficiency from compute efficiency, we design a multi-axis evaluation protocol that records performance against environment steps and gradient steps. We report a segmented backpropagation scheme with MC and critic-based bootstrap modes that mitigates gradient degradation on long-horizon tasks, and present ablations over segment length and bootstrap strategy.
-\end{abstract}
+Model-free reinforcement learning algorithms such as Proximal Policy Optimization (PPO) treat the environment as a black box, estimating policy gradients from sampled rewards; this process demands millions of interactions and relies on high-variance advantage estimates. When environment dynamics are differentiable, the return is an end-to-end differentiable function of the policy parameters, enabling exact gradient computation via backpropagation through simulation. We term this approach Analytic Policy Gradients (APG) and evaluate it against PPO on four continuous control tasks of increasing dynamical complexity: a one-dimensional point-mass target-reaching task, a 2D point-mass navigation task with obstacle avoidance, a 2D rigid-body T-block pushing task, and a 7-DOF Franka FR3 end-effector reaching task. Both algorithms share identical model architectures, observation normalization, and optimizer settings. To decouple sample efficiency from compute efficiency, we design a multi-axis evaluation protocol that records performance against environment steps and gradient steps. We report a segmented backpropagation scheme with MC and critic-based bootstrap modes that mitigates gradient degradation on long-horizon tasks, and present ablations over segment length and bootstrap strategy.\end{abstract}
 
 % ==============================================================================
 \section{Introduction}
@@ -667,24 +666,24 @@ The efficiency tables (Tables~\ref{tab:sample_eff}--\ref{tab:grad_eff}) report t
 \begin{figure}[htbp]
   \centering
   \begin{subfigure}[b]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../figures/PointMassSimple-v0_return_curve}
+    \includegraphics[width=\textwidth]{figures/PointMassSimple-v0_return_curve}
     \caption{PointMassSimple}
   \end{subfigure}
   \hfill
   \begin{subfigure}[b]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../figures/point_mass}
+    \includegraphics[width=\textwidth]{figures/point_mass}
     \caption{PointMassNavigate}
   \end{subfigure}
 
   \vspace{0.5em}
 
   \begin{subfigure}[b]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../figures/push_t}
+    \includegraphics[width=\textwidth]{figures/push_t}
     \caption{PushT}
   \end{subfigure}
   \hfill
   \begin{subfigure}[b]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../figures/franka_reach}
+    \includegraphics[width=\textwidth]{figures/franka_reach}
     \caption{FrankaReach}
   \end{subfigure}
   \caption{Episodic return (mean $\pm$ std) vs.\ total gradient steps for PPO (blue) and APG (orange). The x-axis is equalized: both algorithms execute the same total number of gradient updates.}
@@ -754,12 +753,12 @@ Both modes reach a success rate of $1.0$ by the end of training. The critic boot
 \begin{figure}[htbp]
   \centering
   \begin{subfigure}[b]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../figures/ablation_bootstrap_return}
+    \includegraphics[width=\textwidth]{figures/ablation_bootstrap_return}
     \caption{Return vs.\ environment steps}
   \end{subfigure}
   \hfill
   \begin{subfigure}[b]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../figures/ablation_bootstrap_success}
+    \includegraphics[width=\textwidth]{figures/ablation_bootstrap_success}
     \caption{Success rate vs.\ environment steps}
   \end{subfigure}
   \caption{Bootstrap-mode ablation on PointMassNavigate.}
@@ -783,12 +782,12 @@ The results suggest that MC bootstrap should be preferred as the default for sho
 \begin{figure}[htbp]
   \centering
   \begin{subfigure}[b]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../figures/ablation_segment_return}
+    \includegraphics[width=\textwidth]{figures/ablation_segment_return}
     \caption{Final return}
   \end{subfigure}
   \hfill
   \begin{subfigure}[b]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../figures/ablation_segment_success}
+    \includegraphics[width=\textwidth]{figures/ablation_segment_success}
     \caption{Success rate}
   \end{subfigure}
   \caption{Segment-length ablation on PointMassNavigate.}
@@ -985,22 +984,22 @@ Rendered frames and GIFs for the custom differentiable environments are produced
 \begin{figure}[htbp]
   \centering
   \begin{subfigure}[b]{0.45\textwidth}
-    \includegraphics[width=\textwidth]{../figures/point_mass_env}
+    \includegraphics[width=\textwidth]{figures/point_mass_env}
     \caption{PointMassNavigate}
   \end{subfigure}
   \hfill
   \begin{subfigure}[b]{0.45\textwidth}
-    \includegraphics[width=\textwidth]{../figures/push_t_env}
+    \includegraphics[width=\textwidth]{figures/push_t_env}
     \caption{PushT}
   \end{subfigure}
   \vspace{0.3em}
   \begin{subfigure}[b]{0.45\textwidth}
-    \includegraphics[width=\textwidth]{../figures/franka_env}
+    \includegraphics[width=\textwidth]{figures/franka_env}
     \caption{FrankaReach}
   \end{subfigure}
   \hfill
   \begin{subfigure}[b]{0.45\textwidth}
-    \includegraphics[width=\textwidth]{../figures/SimplePointMass}
+    \includegraphics[width=\textwidth]{figures/SimplePointMass}
     \caption{SimplePointMass}
   \end{subfigure}
   \caption{Environment renderings of the four continuous control tasks.}
