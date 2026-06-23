@@ -7,7 +7,7 @@
 
 **Backpropagating Through Simulation: Analytic Policy Gradients for Sample and Learning Efficient Differentiable Continuous Control**
 
-> 📄 **Full methodology, results, and analysis:** See the [project report (PDF)](report/report.pdf)
+> 📄 **Full methodology, results, and analysis:** See the [report](https://arxiv.org/pdf/2606.21525)
 
 ---
 
@@ -249,18 +249,21 @@ The following figures show APG vs PPO comparison across environments, along with
 |---|---|
 | ![Bootstrap](figures/ablation_bootstrap_return.png) | ![Segment](figures/ablation_segment_return.png) |
 
-> Full results and analysis are available in the [project report](report/report.pdf).
+> Full results and analysis are available in the [report](https://arxiv.org/pdf/2606.21525).
 
 ## Citation
 
 If you find this work useful, please cite:
 
 ```bibtex
-@software{deng2026apg,
-  title={Backpropagating Through Simulation: Analytic Policy Gradients for Sample and Learning Efficient Differentiable Continuous Control},
-  author={Deng, Yueci},
-  url={https://github.com/yuecideng/analytic_policy_gradients},
-  year={2026}
+@misc{deng2026backpropagatingsimulationanalyticpolicy,
+      title={Backpropagating Through Simulation: Analytic Policy Gradients for Sample and Learning Efficient Differentiable Continuous Control}, 
+      author={Yueci Deng},
+      year={2026},
+      eprint={2606.21525},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2606.21525}, 
 }
 ```
 
